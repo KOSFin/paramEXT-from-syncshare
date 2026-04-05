@@ -116,8 +116,9 @@ class Database:
                 )
 
                 for question in questions:
-                    question_verified = bool(question.get('verified'))
-                    question_correct = bool(question.get('isCorrect')) or question_verified
+                    # `verified` from the extension means the UI exposed correctness markers,
+                    # not that the user solved the question correctly.
+                    question_correct = bool(question.get('isCorrect'))
                     answers = question.get('answers', [])
                     selected_answers_count = sum(1 for answer in answers if bool(answer.get('selected')))
                     explicit_correct_answers_count = sum(1 for answer in answers if bool(answer.get('correct')))

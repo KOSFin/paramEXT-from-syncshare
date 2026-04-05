@@ -13,6 +13,7 @@
     const AUTH_FAILURE_COOLDOWN_MS = 120000;
     const QUERY_COOLDOWN_MS = 12000;
     const BACKEND_LOG_THROTTLE_MS = 30000;
+    const CONTENT_FALLBACK_BLOCK_MS = 90000;
     const DEBUG_SYNC_STORAGE_KEY = 'paramExtOpeneduDebug';
 
     const NEGATIVE_MARK_RE = /(choicegroup_incorrect|(^|[^a-zа-яё])(incorrect|wrong|false|неверн|неправильн|ошиб)([^a-zа-яё]|$))/i;
@@ -63,6 +64,8 @@
     let lastStatsQueryAt = 0;
     let lastStatsResponse = null;
     let scheduledCycleTimer = 0;
+    let contentFallbackBlockedUntil = 0;
+    let contentFallbackBlockedReason = '';
 
     let iframeQuestionsCache = [];
     let topFrameIframeQuestions = null;
@@ -195,6 +198,19 @@
     function delay(ms) {
         return new Promise((resolve) => {
             setTimeout(resolve, ms);
+        });
+    }
+
+    function canUseContentFallback() {
+        return Date.now() >= contentFallbackBlockedUntil;
+    }
+
+    function blockContentFallback(reason) {
+        contentFallbackBlockedUntil = Date.now() + CONTENT_FALLBACK_BLOCK_MS;
+        contentFallbackBlockedReason = String(reason || 'content_fallback_blocked');
+        debugSync('content_fallback_blocked', {
+            reason: contentFallbackBlockedReason,
+            blockedUntil: contentFallbackBlockedUntil
         });
     }
 
@@ -346,14 +362,14 @@
                         isTimeout: Boolean(bgResponse.isTimeout)
                     });
 
-                    // For OpenEdu pages content-side fetch always hits CORS preflight,
-                    // so a background status 0 is returned immediately to avoid noisy duplicates.
-                    return {
-                        ok: false,
-                        status: 0,
-                        error: 'background_status_0: ' + bgStatus0Hint,
-                        data: null
-                    };
+                    if (!canUseContentFallback()) {
+                        return {
+                            ok: false,
+                            status: 0,
+                            error: 'background_status_0: ' + bgStatus0Hint + ' | content_blocked=' + contentFallbackBlockedReason,
+                            data: null
+                        };
+                    }
                 } else {
                     if (logErrors) {
                         maybeLogBackendIssue('openedu_backend_error', {
@@ -451,6 +467,10 @@
                     error: result.error,
                     backgroundHint: bgStatus0Hint
                 });
+
+                if (result.status === 0 && bgStatus0Hint) {
+                    blockContentFallback(result.error || bgStatus0Hint);
+                }
                 return result;
             }
 
@@ -461,6 +481,8 @@
                 ok: true,
                 status: Number(response.status || 200)
             });
+            contentFallbackBlockedUntil = 0;
+            contentFallbackBlockedReason = '';
             return {
                 ok: true,
                 status: Number(response.status || 200),
@@ -499,6 +521,10 @@
                 backgroundHint: bgStatus0Hint
             });
 
+            if (bgStatus0Hint) {
+                blockContentFallback(combinedMessage || bgStatus0Hint);
+            }
+
             return result;
         } finally {
             clearTimeout(timer);
@@ -535,6 +561,11 @@
 
             if (last.status === 401 || last.status === 403) {
                 blockSync('auth_' + String(last.status), AUTH_FAILURE_COOLDOWN_MS);
+                break;
+            }
+
+            if (last.status === 0 && String(last.error || '').includes('background_status_0')) {
+                // Persistent background transport failures are not fixed by immediate retries.
                 break;
             }
 
@@ -1194,11 +1225,19 @@
 
         const result = await postWithRetry('/v1/openedu/solutions/query', queryPayload, 1);
         const statsByQuestion = result?.data?.statsByQuestion;
+        const statsKeys = statsByQuestion && typeof statsByQuestion === 'object' ? Object.keys(statsByQuestion) : [];
+        const nonEmptyStatsKeys = statsKeys.filter((key) => {
+            const entry = statsByQuestion?.[key];
+            const verifiedCount = Array.isArray(entry?.verifiedAnswers) ? entry.verifiedAnswers.length : 0;
+            const fallbackCount = Array.isArray(entry?.fallbackAnswers) ? entry.fallbackAnswers.length : 0;
+            return verifiedCount > 0 || fallbackCount > 0;
+        });
         debugSync('pull_statistics_result', {
             ok: result.ok,
             status: result.status,
             error: result.error || '',
-            statsKeys: statsByQuestion && typeof statsByQuestion === 'object' ? Object.keys(statsByQuestion).length : 0
+            statsKeys: statsKeys.length,
+            nonEmptyStatsKeys: nonEmptyStatsKeys.length
         });
         return result;
     }
