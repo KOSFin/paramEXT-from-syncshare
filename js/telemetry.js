@@ -1,8 +1,12 @@
 (function (global) {
     const MAX_QUEUE_SIZE = 20;
     const RECOVERY_FLAG_KEY = '__paramext_context_recovery_ts';
+    const AUTH_BLOCK_MS = 120000;
+    const ERROR_BLOCK_MS = 15000;
     const installedHandlerScopes = new Set();
     const queue = [];
+    let flushInFlight = false;
+    let blockedUntil = 0;
 
     function safeGetExtensionVersion() {
         try {
@@ -94,6 +98,7 @@
 
         if (token && token.length > 0) {
             headers.Authorization = 'Bearer ' + token;
+            headers['X-API-Token'] = token;
         }
 
         return headers;
@@ -169,47 +174,96 @@
             return;
         }
 
-        const settings = await getSettingsSafe();
-        const backendConfig = pickBackendConfig(settings, scope);
-        const baseUrl = normalizeBaseUrl(backendConfig?.apiBaseUrl);
-        if (!baseUrl) {
+        if (flushInFlight) {
             return;
         }
 
-        const token = backendConfig?.apiToken || '';
-        const timeoutMs = Number(backendConfig?.requestTimeoutMs || 4000);
+        if (blockedUntil > Date.now()) {
+            return;
+        }
 
-        while (queue.length > 0) {
-            const packet = queue.shift();
-            if (!packet) {
-                continue;
+        flushInFlight = true;
+
+        try {
+            const settings = await getSettingsSafe();
+            const backendConfig = pickBackendConfig(settings, scope);
+            const baseUrl = normalizeBaseUrl(backendConfig?.apiBaseUrl);
+            if (!baseUrl) {
+                return;
             }
 
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            const token = backendConfig?.apiToken || '';
+            const timeoutMs = Number(backendConfig?.requestTimeoutMs || 4000);
 
-            try {
-                const bgResponse = await requestViaBackground({
-                    url: baseUrl + '/v1/logs/client',
-                    method: 'POST',
-                    headers: buildHeaders(token),
-                    body: JSON.stringify(packet),
-                    timeoutMs
-                });
+            while (queue.length > 0) {
+                const packet = queue[0];
+                if (!packet) {
+                    queue.shift();
+                    continue;
+                }
 
-                if (!bgResponse) {
-                    await fetch(baseUrl + '/v1/logs/client', {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+                let delivered = false;
+
+                try {
+                    const bgResponse = await requestViaBackground({
+                        url: baseUrl + '/v1/logs/client',
                         method: 'POST',
                         headers: buildHeaders(token),
                         body: JSON.stringify(packet),
-                        signal: controller.signal
+                        timeoutMs
                     });
+
+                    if (bgResponse) {
+                        if (bgResponse.ok) {
+                            delivered = true;
+                        } else {
+                            const status = Number(bgResponse.status || 0);
+                            if (status === 401 || status === 403) {
+                                blockedUntil = Date.now() + AUTH_BLOCK_MS;
+                                queue.shift();
+                                break;
+                            }
+
+                            blockedUntil = Date.now() + ERROR_BLOCK_MS;
+                            break;
+                        }
+                    } else {
+                        const response = await fetch(baseUrl + '/v1/logs/client', {
+                            method: 'POST',
+                            headers: buildHeaders(token),
+                            body: JSON.stringify(packet),
+                            signal: controller.signal
+                        });
+
+                        if (response.ok) {
+                            delivered = true;
+                        } else {
+                            if (response.status === 401 || response.status === 403) {
+                                blockedUntil = Date.now() + AUTH_BLOCK_MS;
+                                queue.shift();
+                                break;
+                            }
+
+                            blockedUntil = Date.now() + ERROR_BLOCK_MS;
+                            break;
+                        }
+                    }
+                } catch (_) {
+                    blockedUntil = Date.now() + ERROR_BLOCK_MS;
+                    break;
+                } finally {
+                    clearTimeout(timer);
                 }
-            } catch (_) {
-                // Keep telemetry fully non-blocking.
-            } finally {
-                clearTimeout(timer);
+
+                if (delivered) {
+                    queue.shift();
+                }
             }
+        } finally {
+            flushInFlight = false;
         }
     }
 

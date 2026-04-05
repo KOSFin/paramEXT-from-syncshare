@@ -5,9 +5,13 @@
     const QUESTION_KEY_ATTR = 'data-paramext-openedu-question-key';
     const INLINE_WAND_ATTR = 'data-paramext-openedu-inline-wand';
     const INLINE_MENU_CLASS = 'paramext-openedu-inline-menu';
+    const WAND_VISIBILITY_KEY = 'paramExtOpeneduWandsHidden';
     const MAX_ANSWERS_PER_QUESTION = 5;
     const RETRY_DELAYS_MS = [0, 350, 900];
-    const CYCLE_INTERVAL_MS = 7000;
+    const CYCLE_INTERVAL_MS = 18000;
+    const MIN_CYCLE_GAP_MS = 8000;
+    const AUTH_FAILURE_COOLDOWN_MS = 120000;
+    const QUERY_COOLDOWN_MS = 12000;
     const BACKEND_LOG_THROTTLE_MS = 30000;
 
     const NEGATIVE_MARK_RE = /(choicegroup_incorrect|(^|[^a-zа-яё])(incorrect|wrong|false|неверн|неправильн|ошиб)([^a-zа-яё]|$))/i;
@@ -35,9 +39,18 @@
     let statusText = null;
     let lastAutoAdvanceAt = 0;
     let cycleInFlight = false;
+    let lastCycleAt = 0;
     let panelVisible = false;
+    let wandsHidden = false;
+    let syncBlockedUntil = 0;
+    let syncBlockedReason = '';
     let lastBackendIssueAt = 0;
     let lastBackendIssueSignature = '';
+    let lastAttemptPayloadHash = '';
+    let lastStatsQuerySignature = '';
+    let lastStatsQueryAt = 0;
+    let lastStatsResponse = null;
+    let scheduledCycleTimer = 0;
 
     function textOf(node) {
         return (node && node.textContent ? node.textContent : '').replace(/\s+/g, ' ').trim();
@@ -87,6 +100,7 @@
         }
         if (token.length > 0) {
             headers.Authorization = 'Bearer ' + token;
+            headers['X-API-Token'] = token;
         }
         return headers;
     }
@@ -293,6 +307,15 @@
             data: null
         };
 
+        if (isSyncBlocked()) {
+            return {
+                ok: false,
+                status: 0,
+                error: syncBlockedReason || 'sync_blocked',
+                data: null
+            };
+        }
+
         for (let attempt = 0; attempt <= retries; attempt += 1) {
             if (attempt > 0) {
                 const delayMs = RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)] || 300;
@@ -304,6 +327,11 @@
                 return last;
             }
 
+            if (last.status === 401 || last.status === 403) {
+                blockSync('auth_' + String(last.status), AUTH_FAILURE_COOLDOWN_MS);
+                break;
+            }
+
             if (last.status >= 400 && last.status < 500 && last.status !== 429) {
                 break;
             }
@@ -312,9 +340,91 @@
         return last;
     }
 
+    function blockSync(reason, durationMs) {
+        syncBlockedReason = String(reason || 'sync_blocked');
+        syncBlockedUntil = Date.now() + Math.max(5000, Number(durationMs || AUTH_FAILURE_COOLDOWN_MS));
+    }
+
+    function clearSyncBlock() {
+        syncBlockedUntil = 0;
+        syncBlockedReason = '';
+    }
+
+    function isSyncBlocked() {
+        return syncBlockedUntil > Date.now();
+    }
+
+    function applyWandsVisibilityToDocument(doc, visible) {
+        if (!doc || !doc.documentElement) {
+            return;
+        }
+        doc.documentElement.classList.toggle('paramext-openedu-hide-wands', !visible);
+    }
+
+    async function persistWandsVisibility(value) {
+        try {
+            await chrome.storage.local.set({ [WAND_VISIBILITY_KEY]: Boolean(value) });
+        } catch (_) {
+            // Ignore persistence errors.
+        }
+    }
+
+    function setWandsHidden(hidden, persist) {
+        wandsHidden = Boolean(hidden);
+        const visible = !wandsHidden;
+
+        const docs = getSearchDocuments();
+        docs.forEach((doc) => {
+            applyWandsVisibilityToDocument(doc, visible);
+        });
+        applyWandsVisibilityToDocument(document, visible);
+
+        if (!visible) {
+            panelVisible = false;
+            if (stickRoot) {
+                stickRoot.classList.add('hidden');
+            }
+            if (wandToggle) {
+                wandToggle.classList.remove('active');
+            }
+        }
+
+        if (persist) {
+            persistWandsVisibility(wandsHidden);
+        }
+    }
+
+    async function loadWandsHiddenState() {
+        try {
+            const payload = await chrome.storage.local.get(WAND_VISIBILITY_KEY);
+            return Boolean(payload && payload[WAND_VISIBILITY_KEY]);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function scheduleCycle(force) {
+        if (scheduledCycleTimer) {
+            return;
+        }
+
+        scheduledCycleTimer = setTimeout(() => {
+            scheduledCycleTimer = 0;
+            runStickCycle(Boolean(force));
+        }, 350);
+    }
+
     function describeRequestError(result) {
         if (!result || result.ok) {
             return '';
+        }
+
+        if (result.error === 'auth_401' || result.error === 'auth_403') {
+            return result.error === 'auth_401' ? '401 (токен)' : '403 (доступ)';
+        }
+
+        if (result.error === 'sync_blocked') {
+            return 'sync блокирован';
         }
 
         if (result.error === 'api_base_url_missing') {
@@ -427,38 +537,28 @@
     }
 
     function getQuestionBlocks() {
-        const selectors = [
-            '.problems-wrapper[data-problem-id]',
-            '.xblock-student_view-problem .problems-wrapper',
-            '.xblock-student_view-problem',
-            '.problem[data-problem-id]',
-            '.problem',
-            '.problems-wrapper',
-            '[data-problem-id]',
-            '[id^="problem_"]',
-            '.question'
-        ];
-
         const seen = new WeakSet();
         const result = [];
         const docs = getSearchDocuments();
 
         docs.forEach((doc) => {
-            selectors.forEach((selector) => {
-                const nodes = doc.querySelectorAll(selector);
-                nodes.forEach((node) => {
-                    if (!(node instanceof HTMLElement) || seen.has(node)) {
-                        return;
-                    }
+            const controls = doc.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+            controls.forEach((control) => {
+                if (!(control instanceof HTMLInputElement)) {
+                    return;
+                }
 
-                    const hasAnswers = Boolean(node.querySelector('label[for], input[type="radio"], input[type="checkbox"]'));
-                    if (!hasAnswers) {
-                        return;
-                    }
+                const root = control.closest('[data-problem-id], .problem, .xblock-student_view-problem, .problems-wrapper, [id^="problem_"]');
+                if (!(root instanceof HTMLElement) || seen.has(root)) {
+                    return;
+                }
 
-                    seen.add(node);
-                    result.push(node);
-                });
+                if (!root.querySelector('label[for], input[type="radio"], input[type="checkbox"]')) {
+                    return;
+                }
+
+                seen.add(root);
+                result.push(root);
             });
         });
 
@@ -504,6 +604,19 @@
         const markerText = getMarkerText(label, input);
         if (NEGATIVE_MARK_RE.test(markerText)) {
             return false;
+        }
+
+        const statusRef = String(label?.getAttribute?.('aria-describedby') || input?.getAttribute?.('aria-describedby') || '').trim();
+        if (statusRef) {
+            const statusNode = input?.ownerDocument?.getElementById?.(statusRef) || document.getElementById(statusRef);
+            const statusClass = String(statusNode?.className || '').toLowerCase();
+            const statusText = normalizeText(textOf(statusNode));
+            if (statusClass.includes('incorrect') || NEGATIVE_MARK_RE.test(statusText)) {
+                return false;
+            }
+            if (statusClass.includes('correct') || POSITIVE_MARK_RE.test(statusText)) {
+                return true;
+            }
         }
 
         const explicit = normalizeText(
@@ -1338,6 +1451,10 @@
             return;
         }
 
+        if (wandsHidden) {
+            return;
+        }
+
         if (typeof forceState === 'boolean') {
             panelVisible = forceState;
         } else {
@@ -1429,11 +1546,17 @@
         document.documentElement.appendChild(stickRoot);
     }
 
-    async function runStickCycle() {
+    async function runStickCycle(force) {
+        const now = Date.now();
+        if (!force && now - lastCycleAt < MIN_CYCLE_GAP_MS) {
+            return;
+        }
+
         if (cycleInFlight) {
             return;
         }
 
+        lastCycleAt = now;
         cycleInFlight = true;
         try {
             const questions = parseQuestions();
@@ -1448,8 +1571,78 @@
                 return;
             }
 
-            const pushResult = await pushAttemptSnapshot(questions);
-            const statsResult = await pullStatistics(questions);
+            if (isSyncBlocked()) {
+                const reason = syncBlockedReason === 'auth_401'
+                    ? '401 токен'
+                    : (syncBlockedReason === 'auth_403' ? '403 доступ' : syncBlockedReason || 'blocked');
+
+                const localFallbackStats = buildLocalFallbackStats(questions);
+                const mergedStatsByQuestion = mergeStatsByQuestion(null, localFallbackStats, questions);
+                renderInlineWands(mergedStatsByQuestion, questions);
+
+                if (isTopFrame) {
+                    setStickOnline(false, 'Sync пауза: ' + reason);
+                    renderStick(mergedStatsByQuestion, questions);
+                }
+                return;
+            }
+
+            const context = getCourseContext();
+            const attemptFingerprint = hash(JSON.stringify({
+                context: {
+                    testKey: context.testKey,
+                    path: context.path
+                },
+                questions: questions.map((question) => ({
+                    questionKey: question.questionKey,
+                    correct: question.correct,
+                    verified: question.hasVerifiedAnswer,
+                    answers: question.options.map((option) => ({
+                        answerKey: option.answerKey,
+                        selected: option.selected,
+                        correct: option.correct
+                    }))
+                }))
+            }));
+
+            const questionSignature = hash(JSON.stringify(questions.map((question) => question.questionKey)));
+
+            let pushResult = {
+                ok: true,
+                status: 204,
+                error: 'not_changed',
+                data: null
+            };
+
+            if (attemptFingerprint !== lastAttemptPayloadHash) {
+                pushResult = await pushAttemptSnapshot(questions);
+                if (pushResult.ok) {
+                    lastAttemptPayloadHash = attemptFingerprint;
+                    clearSyncBlock();
+                }
+            }
+
+            const shouldQuery =
+                questionSignature !== lastStatsQuerySignature ||
+                (Date.now() - lastStatsQueryAt) >= QUERY_COOLDOWN_MS ||
+                !lastStatsResponse;
+
+            let statsResult = {
+                ok: true,
+                status: 200,
+                error: 'cached',
+                data: lastStatsResponse || { statsByQuestion: null }
+            };
+
+            if (shouldQuery) {
+                statsResult = await pullStatistics(questions);
+                if (statsResult.ok) {
+                    lastStatsQuerySignature = questionSignature;
+                    lastStatsQueryAt = Date.now();
+                    lastStatsResponse = statsResult.data || { statsByQuestion: null };
+                    clearSyncBlock();
+                }
+            }
 
             const statsByQuestion = statsResult.ok && statsResult.data && typeof statsResult.data === 'object'
                 ? statsResult.data.statsByQuestion || null
@@ -1526,11 +1719,85 @@
         nextButton.click();
     }
 
-    function installKeyboardToggle() {
-        if (!isTopFrame) {
-            return;
-        }
+    function installPageMonitors() {
+        document.addEventListener('click', (event) => {
+            const source = event.target instanceof Element ? event.target : null;
+            if (!source) {
+                return;
+            }
 
+            const actionable = source.closest('.submit, .submit.btn-brand, .problem button, .sequence-navigation-tabs button, .next-btn, .next-button');
+            if (!actionable) {
+                return;
+            }
+
+            if (isTopFrame && actionable.matches('.sequence-navigation-tabs button, .next-btn, .next-button')) {
+                setTimeout(() => {
+                    maybeClickNextOnSequencePage();
+                }, 180);
+            }
+
+            setTimeout(() => {
+                scheduleCycle(true);
+            }, 300);
+        }, true);
+
+        window.addEventListener('message', (event) => {
+            const data = event.data;
+            if (!data) {
+                return;
+            }
+
+            if (typeof data === 'object' && Object.keys(data).length === 1 && Object.prototype.hasOwnProperty.call(data, 'offset')) {
+                return;
+            }
+
+            let text = '';
+            if (typeof data === 'string') {
+                text = data.toLowerCase();
+            } else {
+                try {
+                    text = JSON.stringify(data).toLowerCase();
+                } catch (_) {
+                    text = '';
+                }
+            }
+
+            if (!text) {
+                return;
+            }
+
+            if (/(problem|submission|submitted|grade|correct|incorrect|response|capa)/.test(text)) {
+                scheduleCycle(false);
+            }
+        });
+
+        const observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                if (mutation.type === 'attributes') {
+                    const node = mutation.target;
+                    if (node instanceof Element && node.matches('.status, .message, .feedback, .choicegroup, .response-label, .sequence-navigation-tabs button')) {
+                        scheduleCycle(false);
+                        return;
+                    }
+                }
+
+                if (mutation.type === 'childList' && (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0)) {
+                    scheduleCycle(false);
+                    return;
+                }
+            }
+        });
+
+        observer.observe(document.documentElement || document.body, {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            attributeFilter: ['class', 'aria-label', 'data-tooltip']
+        });
+    }
+
+    function installKeyboardToggle() {
         document.addEventListener('keydown', (event) => {
             if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
                 return;
@@ -1538,7 +1805,10 @@
 
             if (window.ParamExtSettings.hotkeyMatches(event, settings.openedu.stickHotkey)) {
                 event.preventDefault();
-                toggleStick();
+                setWandsHidden(!wandsHidden, true);
+                if (!wandsHidden && isTopFrame) {
+                    toggleStick(false);
+                }
             }
         });
     }
@@ -1549,17 +1819,28 @@
                 return;
             }
 
-            if (!Object.prototype.hasOwnProperty.call(changes, window.ParamExtSettings.STORAGE_KEY)) {
+            const hasSettingsChange = Object.prototype.hasOwnProperty.call(changes, window.ParamExtSettings.STORAGE_KEY);
+            const hasWandVisibilityChange = Object.prototype.hasOwnProperty.call(changes, WAND_VISIBILITY_KEY);
+            if (!hasSettingsChange && !hasWandVisibilityChange) {
                 return;
             }
 
-            settings = await window.ParamExtSettings.getSettings();
-            runStickCycle();
+            if (hasSettingsChange) {
+                settings = await window.ParamExtSettings.getSettings();
+                clearSyncBlock();
+                runStickCycle(true);
+            }
+
+            if (hasWandVisibilityChange) {
+                const hidden = Boolean(changes[WAND_VISIBILITY_KEY]?.newValue);
+                setWandsHidden(hidden, false);
+            }
         });
     }
 
     async function boot() {
         settings = await window.ParamExtSettings.getSettings();
+        wandsHidden = await loadWandsHiddenState();
 
         if (window.ParamExtTelemetry) {
             window.ParamExtTelemetry.push('system_state', {
@@ -1572,7 +1853,9 @@
         }
 
         ensureStickUi();
+        setWandsHidden(wandsHidden, false);
         installKeyboardToggle();
+        installPageMonitors();
         installStorageSync();
 
         if (isTopFrame) {
@@ -1583,7 +1866,7 @@
             }
         }
 
-        runStickCycle();
+        runStickCycle(true);
         setInterval(() => {
             runStickCycle();
         }, CYCLE_INTERVAL_MS);

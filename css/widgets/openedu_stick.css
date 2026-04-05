@@ -228,7 +228,7 @@
 
 .paramext-openedu-inline-popover {
     position: absolute;
-    top: calc(100% + 6px);
+    top: calc(100% - 1px);
     left: 0;
     width: min(360px, 82vw);
     max-height: 280px;
@@ -342,6 +342,13 @@
     animation: paramext-openedu-blink 1.6s ease;
     outline: 2px solid #3a93ff;
     outline-offset: 2px;
+}
+
+.paramext-openedu-hide-wands .paramext-openedu-inline-menu,
+.paramext-openedu-hide-wands .paramext-openedu-inline-wand,
+.paramext-openedu-hide-wands .paramext-openedu-wand-toggle,
+.paramext-openedu-hide-wands .paramext-openedu-stick {
+    display: none !important;
 }
 
 @keyframes paramext-openedu-blink {
