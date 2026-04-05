@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import Depends, FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
@@ -25,6 +26,23 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
+
+# CORS for OpenEdu embeds and extension/service-worker calls.
+# Keep credentials disabled so wildcard origins are safe.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        'https://paramext.ruka.me',
+        'https://syncshare.naloaty.me',
+        'https://syncshare.ru',
+    ],
+    allow_origin_regex=r'^(https://([a-z0-9-]+\.)?openedu\.ru|chrome-extension://[a-z]{32})$',
+    allow_credentials=False,
+    allow_methods=['*'],
+    allow_headers=['*'],
+    expose_headers=['*'],
+    max_age=86400,
+)
 
 
 @app.get('/')

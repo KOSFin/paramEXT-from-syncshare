@@ -13,6 +13,7 @@
     const AUTH_FAILURE_COOLDOWN_MS = 120000;
     const QUERY_COOLDOWN_MS = 12000;
     const BACKEND_LOG_THROTTLE_MS = 30000;
+    const DEBUG_SYNC_STORAGE_KEY = 'paramExtOpeneduDebug';
 
     const NEGATIVE_MARK_RE = /(choicegroup_incorrect|(^|[^a-zа-яё])(incorrect|wrong|false|неверн|неправильн|ошиб)([^a-zа-яё]|$))/i;
     const POSITIVE_MARK_RE = /(choicegroup_correct|(^|[^a-zа-яё])(correct|right|true|верн|правильн)([^a-zа-яё]|$))/i;
@@ -30,6 +31,17 @@
     }
 
     const isTopFrame = window === window.top;
+    const DEBUG_SYNC_ENABLED = (() => {
+        try {
+            const raw = localStorage.getItem(DEBUG_SYNC_STORAGE_KEY);
+            if (raw === null || raw === '') {
+                return true;
+            }
+            return !/^(0|false|off|no)$/i.test(String(raw).trim());
+        } catch (_) {
+            return true;
+        }
+    })();
 
     let settings = null;
     let stickRoot = null;
@@ -51,6 +63,116 @@
     let lastStatsQueryAt = 0;
     let lastStatsResponse = null;
     let scheduledCycleTimer = 0;
+
+    let iframeQuestionsCache = [];
+    let topFrameIframeQuestions = null;
+    let topFrameIframeStats = null;
+    let topFrameOnlineState = { online: false, text: 'Wait...' };
+    window.__PARAMEXT_TOPFRAME_ONLINE_STATE = topFrameOnlineState;
+    let _topContextPromise = null;
+
+    function debugSync(event, payload) {
+        if (!DEBUG_SYNC_ENABLED) {
+            return;
+        }
+
+        try {
+            console.log('[paramEXT OpenEdu][' + (isTopFrame ? 'top' : 'iframe') + '] ' + event, payload || {});
+        } catch (_) {
+            // Ignore console errors.
+        }
+    }
+
+    function summarizeQuestionsForDebug(questions) {
+        return (Array.isArray(questions) ? questions : []).map((question) => ({
+            questionKey: question.questionKey,
+            prompt: String(question.prompt || '').slice(0, 160),
+            isCorrect: Boolean(question.correct),
+            hasVerifiedAnswer: Boolean(question.hasVerifiedAnswer),
+            selectedAnswers: (Array.isArray(question.options) ? question.options : [])
+                .filter((option) => option.selected)
+                .map((option) => ({
+                    answerKey: option.answerKey,
+                    answerText: option.answerText,
+                    selected: Boolean(option.selected),
+                    markedCorrect: Boolean(option.correct)
+                })),
+            markedCorrectAnswers: (Array.isArray(question.options) ? question.options : [])
+                .filter((option) => option.correct)
+                .map((option) => ({
+                    answerKey: option.answerKey,
+                    answerText: option.answerText
+                }))
+        }));
+    }
+
+    function requestTopContext() {
+        if (isTopFrame) return Promise.resolve(null);
+        if (window.__PARAMEXT_TOP_CONTEXT) return Promise.resolve(window.__PARAMEXT_TOP_CONTEXT);
+        if (_topContextPromise) return _topContextPromise;
+        _topContextPromise = new Promise(resolve => {
+            let handled = false;
+            const listener = (event) => {
+                if (event.data && event.data.type === 'PARAMEXT_OPENEDU_CONTEXT_REPLY') {
+                    window.removeEventListener('message', listener);
+                    window.__PARAMEXT_TOP_CONTEXT = event.data.context;
+                    handled = true;
+                    resolve(event.data.context);
+                }
+            };
+            window.addEventListener('message', listener);
+            try { window.top.postMessage({ type: 'PARAMEXT_OPENEDU_CONTEXT_REQUEST' }, '*'); } catch (e) {}
+            setTimeout(() => {
+                if (!handled) {
+                    window.removeEventListener('message', listener);
+                    resolve(null);
+                }
+            }, 1500);
+        });
+        return _topContextPromise;
+    }
+
+    window.addEventListener('message', (event) => {
+        if (!event.data || typeof event.data.type !== 'string') return;
+
+        if (isTopFrame) {
+            if (event.data.type === 'PARAMEXT_OPENEDU_CONTEXT_REQUEST') {
+                try {
+                    event.source.postMessage({
+                        type: 'PARAMEXT_OPENEDU_CONTEXT_REPLY',
+                        context: getCourseContext(true)
+                    }, '*');
+                } catch (e) {}
+            } else if (event.data.type === 'PARAMEXT_OPENEDU_QUESTIONS_SYNC') {
+                topFrameIframeStats = event.data.stats;
+                topFrameIframeQuestions = event.data.questions;
+                debugSync('top_received_iframe_sync', {
+                    questionCount: Array.isArray(topFrameIframeQuestions) ? topFrameIframeQuestions.length : 0,
+                    statKeys: topFrameIframeStats && typeof topFrameIframeStats === 'object' ? Object.keys(topFrameIframeStats).length : 0
+                });
+                renderStick(topFrameIframeStats, topFrameIframeQuestions);
+            } else if (event.data.type === 'PARAMEXT_OPENEDU_STICK_ONLINE') {
+                topFrameOnlineState = { online: Boolean(event.data.online), text: String(event.data.text || '') };
+                window.__PARAMEXT_TOPFRAME_ONLINE_STATE = topFrameOnlineState;
+                debugSync('top_received_iframe_online', topFrameOnlineState);
+                setStickOnline(topFrameOnlineState.online, topFrameOnlineState.text);
+            }
+        } else {
+            if (event.data.type === 'PARAMEXT_APPLY_ANSWER') {
+                const targetKey = event.data.questionKey;
+                const answer = event.data.answer;
+                debugSync('iframe_apply_answer_command', {
+                    questionKey: targetKey,
+                    answerKey: answer?.answerKey || '',
+                    answerText: answer?.answerText || ''
+                });
+                const q = iframeQuestionsCache.find(x => x.questionKey === targetKey);
+                if (q) {
+                    applyAnswerToQuestion(q, answer);
+                }
+            }
+        }
+    });
 
     function textOf(node) {
         return (node && node.textContent ? node.textContent : '').replace(/\s+/g, ' ').trim();
@@ -170,6 +292,7 @@
     async function requestJson(method, path, body, logErrors) {
         const baseUrl = normalizeApiBaseUrl();
         if (!baseUrl) {
+            debugSync('http_skip_no_api_base_url', { method, path });
             return {
                 ok: false,
                 status: 0,
@@ -190,6 +313,16 @@
             request.body = JSON.stringify(body);
         }
 
+        debugSync('http_request', {
+            method,
+            path,
+            url: request.url,
+            timeoutMs,
+            hasBody: body !== null,
+            bodyBytes: request.body ? request.body.length : 0
+        });
+
+        let bgStatus0Hint = '';
         const bgResponse = await requestViaBackground(request);
         if (bgResponse) {
             if (!bgResponse.ok) {
@@ -201,24 +334,63 @@
                     data: null
                 };
 
-                if (logErrors) {
-                    maybeLogBackendIssue('openedu_backend_error', {
+                if (result.status === 0) {
+                    bgStatus0Hint = result.error || String(bgResponse.responseType || 'status_0');
+                    debugSync('http_background_status_0_fallback', {
                         method,
                         path,
                         status: result.status,
                         error: result.error,
-                        via: 'background'
+                        responseType: bgResponse.responseType || '',
+                        errorName: bgResponse.errorName || '',
+                        isTimeout: Boolean(bgResponse.isTimeout)
                     });
+
+                    // For OpenEdu pages content-side fetch always hits CORS preflight,
+                    // so a background status 0 is returned immediately to avoid noisy duplicates.
+                    return {
+                        ok: false,
+                        status: 0,
+                        error: 'background_status_0: ' + bgStatus0Hint,
+                        data: null
+                    };
+                } else {
+                    if (logErrors) {
+                        maybeLogBackendIssue('openedu_backend_error', {
+                            method,
+                            path,
+                            status: result.status,
+                            error: result.error,
+                            via: 'background'
+                        });
+                    }
+                    debugSync('http_response', {
+                        method,
+                        path,
+                        via: 'background',
+                        ok: false,
+                        status: result.status,
+                        error: result.error
+                    });
+                    return result;
                 }
-                return result;
             }
 
-            return {
-                ok: true,
-                status: Number(bgResponse.status || 200),
-                error: '',
-                data: bgResponse.json && typeof bgResponse.json === 'object' ? bgResponse.json : null
-            };
+            if (bgResponse.ok) {
+                debugSync('http_response', {
+                    method,
+                    path,
+                    via: 'background',
+                    ok: true,
+                    status: Number(bgResponse.status || 200)
+                });
+                return {
+                    ok: true,
+                    status: Number(bgResponse.status || 200),
+                    error: '',
+                    data: bgResponse.json && typeof bgResponse.json === 'object' ? bgResponse.json : null
+                };
+            }
         }
 
         const controller = new AbortController();
@@ -249,10 +421,15 @@
             }
 
             if (!response.ok) {
+                let contentError = errorMessageFromPayload(data) || text || ('http_' + String(response.status || 0));
+                if (Number(response.status || 0) === 0 && bgStatus0Hint) {
+                    contentError = 'status_0_content | bg=' + bgStatus0Hint;
+                }
+
                 const result = {
                     ok: false,
                     status: Number(response.status || 0),
-                    error: errorMessageFromPayload(data) || text || ('http_' + String(response.status || 0)),
+                    error: contentError,
                     data: null
                 };
 
@@ -265,9 +442,25 @@
                         via: 'content'
                     });
                 }
+                debugSync('http_response', {
+                    method,
+                    path,
+                    via: 'content',
+                    ok: false,
+                    status: result.status,
+                    error: result.error,
+                    backgroundHint: bgStatus0Hint
+                });
                 return result;
             }
 
+            debugSync('http_response', {
+                method,
+                path,
+                via: 'content',
+                ok: true,
+                status: Number(response.status || 200)
+            });
             return {
                 ok: true,
                 status: Number(response.status || 200),
@@ -275,11 +468,14 @@
                 data
             };
         } catch (error) {
-            const message = error && error.message ? String(error.message) : 'network_error';
+            const rawMessage = error && error.message ? String(error.message) : '';
+            const fallbackMessage = controller.signal.aborted ? 'request_timeout' : 'network_error';
+            const message = rawMessage || fallbackMessage;
+            const combinedMessage = bgStatus0Hint ? (message + ' | bg=' + bgStatus0Hint) : message;
             const result = {
                 ok: false,
                 status: 0,
-                error: message,
+                error: combinedMessage,
                 data: null
             };
 
@@ -288,10 +484,20 @@
                     method,
                     path,
                     status: 0,
-                    error: message,
+                    error: combinedMessage,
                     via: 'content'
                 });
             }
+
+            debugSync('http_response', {
+                method,
+                path,
+                via: 'content',
+                ok: false,
+                status: 0,
+                error: combinedMessage,
+                backgroundHint: bgStatus0Hint
+            });
 
             return result;
         } finally {
@@ -476,7 +682,11 @@
         return hasHttpResponse;
     }
 
-    function getCourseContext() {
+    function getCourseContext(forceTop = false) {
+        if (!forceTop && !isTopFrame && window.__PARAMEXT_TOP_CONTEXT) {
+            return window.__PARAMEXT_TOP_CONTEXT;
+        }
+
         let path = location.pathname;
         let fullUrl = location.href;
 
@@ -944,15 +1154,44 @@
             }))
         };
 
-        return await postWithRetry('/v1/openedu/attempts', payload, 2);
+        debugSync('push_attempt_snapshot_payload', {
+            context,
+            completed: payload.completed,
+            questionCount: payload.questions.length,
+            questions: summarizeQuestionsForDebug(questions)
+        });
+
+        const result = await postWithRetry('/v1/openedu/attempts', payload, 2);
+        debugSync('push_attempt_snapshot_result', {
+            ok: result.ok,
+            status: result.status,
+            error: result.error || ''
+        });
+        return result;
     }
 
     async function pullStatistics(questions) {
         const context = getCourseContext();
-        return await postWithRetry('/v1/openedu/solutions/query', {
+        const queryPayload = {
             context,
             questionKeys: questions.map((question) => question.questionKey)
-        }, 1);
+        };
+
+        debugSync('pull_statistics_payload', {
+            context,
+            questionCount: queryPayload.questionKeys.length,
+            questionKeys: queryPayload.questionKeys
+        });
+
+        const result = await postWithRetry('/v1/openedu/solutions/query', queryPayload, 1);
+        const statsByQuestion = result?.data?.statsByQuestion;
+        debugSync('pull_statistics_result', {
+            ok: result.ok,
+            status: result.status,
+            error: result.error || '',
+            statsKeys: statsByQuestion && typeof statsByQuestion === 'object' ? Object.keys(statsByQuestion).length : 0
+        });
+        return result;
     }
 
     function locateQuestionBlock(question) {
@@ -1080,12 +1319,24 @@
     function applyAnswersToQuestion(question, answers, mode) {
         const block = locateQuestionBlock(question);
         if (!block) {
+            debugSync('apply_answers_failed', {
+                reason: 'question_block_not_found',
+                questionKey: question?.questionKey || ''
+            });
             return false;
         }
 
         const options = getAnswerOptions(block);
         const targets = resolveTargetOptions(options, answers);
         if (targets.length === 0) {
+            debugSync('apply_answers_failed', {
+                reason: 'target_answers_not_resolved',
+                questionKey: question?.questionKey || '',
+                requestedAnswers: Array.isArray(answers) ? answers.map((item) => ({
+                    answerKey: item?.answerKey || '',
+                    answerText: item?.answerText || item || ''
+                })) : []
+            });
             return false;
         }
 
@@ -1093,12 +1344,28 @@
         if (!multi) {
             const input = findInputForOption(block, targets[0]);
             if (!(input instanceof HTMLInputElement)) {
+                debugSync('apply_answers_failed', {
+                    reason: 'input_not_found_single',
+                    questionKey: question?.questionKey || '',
+                    target: {
+                        answerKey: targets[0]?.answerKey || '',
+                        answerText: targets[0]?.answerText || ''
+                    }
+                });
                 return false;
             }
 
             input.click();
             input.dispatchEvent(new Event('change', { bubbles: true }));
             highlightQuestionBlock(block);
+            debugSync('apply_answers_success', {
+                questionKey: question?.questionKey || '',
+                mode: 'single',
+                selected: [{
+                    answerKey: targets[0]?.answerKey || '',
+                    answerText: targets[0]?.answerText || ''
+                }]
+            });
             return true;
         }
 
@@ -1111,6 +1378,10 @@
         });
 
         if (selectedInputs.size === 0) {
+            debugSync('apply_answers_failed', {
+                reason: 'no_checkbox_inputs_resolved',
+                questionKey: question?.questionKey || ''
+            });
             return false;
         }
 
@@ -1129,6 +1400,14 @@
         }
 
         highlightQuestionBlock(block);
+        debugSync('apply_answers_success', {
+            questionKey: question?.questionKey || '',
+            mode: modeName,
+            selected: targets.map((item) => ({
+                answerKey: item.answerKey,
+                answerText: item.answerText
+            }))
+        });
         return true;
     }
 
@@ -1560,24 +1839,53 @@
         cycleInFlight = true;
         try {
             const questions = parseQuestions();
+            iframeQuestionsCache = questions;
+            debugSync('cycle_parsed_questions', {
+                force: Boolean(force),
+                questionCount: questions.length,
+                questions: summarizeQuestionsForDebug(questions)
+            });
+            
             if (questions.length === 0) {
                 renderInlineWands({}, []);
+                debugSync('cycle_no_questions', {
+                    usingTopIframeCache: Boolean(isTopFrame && topFrameIframeQuestions && topFrameIframeQuestions.length > 0)
+                });
 
                 if (isTopFrame) {
-                    const online = await probeBackendOnline();
-                    setStickOnline(online, online ? 'API доступен' : 'API недоступен');
-                    renderStick(null, []);
+                    if (topFrameIframeQuestions && topFrameIframeQuestions.length > 0) {
+                        const iframeOnlineState = (typeof topFrameOnlineState !== 'undefined' && topFrameOnlineState)
+                            || window.__PARAMEXT_TOPFRAME_ONLINE_STATE
+                            || { online: false, text: 'API недоступен' };
+                        setStickOnline(Boolean(iframeOnlineState.online), String(iframeOnlineState.text || 'API недоступен'));
+                        renderStick(topFrameIframeStats, topFrameIframeQuestions);
+                    } else {
+                        const online = await probeBackendOnline();
+                        setStickOnline(online, online ? 'API доступен' : 'API недоступен');
+                        renderStick(null, []);
+                    }
                 }
                 return;
+            }
+
+            if (!isTopFrame) {
+                await requestTopContext();
             }
 
             if (isSyncBlocked()) {
                 const reason = syncBlockedReason === 'auth_401'
                     ? '401 токен'
-                    : (syncBlockedReason === 'auth_403' ? '403 доступ' : syncBlockedReason || 'blocked');
+                    : (syncBlockedReason === 'auth_403'
+                        ? '403 доступ'
+                        : (syncBlockedReason === 'network_0' ? 'network 0 (пауза)' : syncBlockedReason || 'blocked'));
 
-                const localFallbackStats = buildLocalFallbackStats(questions);
-                const mergedStatsByQuestion = mergeStatsByQuestion(null, localFallbackStats, questions);
+                debugSync('cycle_sync_blocked', {
+                    reason,
+                    syncBlockedReason,
+                    syncBlockedUntil
+                });
+
+                const mergedStatsByQuestion = mergeStatsByQuestion(null, null, questions);
                 renderInlineWands(mergedStatsByQuestion, questions);
 
                 if (isTopFrame) {
@@ -1620,6 +1928,10 @@
                     lastAttemptPayloadHash = attemptFingerprint;
                     clearSyncBlock();
                 }
+            } else {
+                debugSync('push_attempt_snapshot_skipped', {
+                    reason: 'same_attempt_fingerprint'
+                });
             }
 
             const shouldQuery =
@@ -1642,33 +1954,92 @@
                     lastStatsResponse = statsResult.data || { statsByQuestion: null };
                     clearSyncBlock();
                 }
+            } else {
+                debugSync('pull_statistics_skipped', {
+                    reason: 'cooldown_or_signature_not_changed',
+                    sinceLastMs: Date.now() - lastStatsQueryAt
+                });
+            }
+
+            if (!pushResult.ok && !statsResult.ok && Number(pushResult.status || 0) === 0 && Number(statsResult.status || 0) === 0) {
+                blockSync('network_0', 45000);
+                debugSync('cycle_network_backoff', {
+                    pushError: pushResult.error || '',
+                    statsError: statsResult.error || '',
+                    syncBlockedUntil
+                });
             }
 
             const statsByQuestion = statsResult.ok && statsResult.data && typeof statsResult.data === 'object'
                 ? statsResult.data.statsByQuestion || null
                 : null;
 
-            const localFallbackStats = buildLocalFallbackStats(questions);
-            const mergedStatsByQuestion = mergeStatsByQuestion(statsByQuestion, localFallbackStats, questions);
+            const mergedStatsByQuestion = mergeStatsByQuestion(statsByQuestion, null, questions);
+            debugSync('cycle_stats_merged', {
+                pushOk: pushResult.ok,
+                pushStatus: pushResult.status,
+                pushError: pushResult.error || '',
+                statsOk: statsResult.ok,
+                statsStatus: statsResult.status,
+                statsError: statsResult.error || '',
+                mergedKeys: mergedStatsByQuestion && typeof mergedStatsByQuestion === 'object'
+                    ? Object.keys(mergedStatsByQuestion).length
+                    : 0
+            });
 
             renderInlineWands(mergedStatsByQuestion, questions);
 
-            if (isTopFrame) {
-                if (pushResult.ok || statsResult.ok) {
-                    setStickOnline(true, 'API доступен');
+            let onlineState = { online: true, text: 'API доступен' };
+            if (!pushResult.ok && !statsResult.ok) {
+                const pushErr = describeRequestError(pushResult);
+                const statsErr = describeRequestError(statsResult);
+                const errText = [pushErr, statsErr].filter(Boolean).join(' / ');
+                const probeOnline = await probeBackendOnline();
+                if (probeOnline) {
+                    onlineState = { online: true, text: 'API ок, sync: ' + (errText || 'ошибка') };
                 } else {
-                    const pushErr = describeRequestError(pushResult);
-                    const statsErr = describeRequestError(statsResult);
-                    const errText = [pushErr, statsErr].filter(Boolean).join(' / ');
-                    const probeOnline = await probeBackendOnline();
-                    if (probeOnline) {
-                        setStickOnline(true, 'API ок, sync: ' + (errText || 'ошибка'));
-                    } else {
-                        setStickOnline(false, 'API недоступен: ' + (errText || 'network'));
-                    }
+                    onlineState = { online: false, text: 'API недоступен: ' + (errText || 'network') };
                 }
+            }
 
+            if (isTopFrame) {
+                setStickOnline(onlineState.online, onlineState.text);
                 renderStick(mergedStatsByQuestion, questions);
+            } else {
+                try {
+                    const simplifiedQuestions = questions.map(q => ({
+                        questionKey: q.questionKey,
+                        domId: q.domId,
+                        correct: q.correct,
+                        hasVerifiedAnswer: q.hasVerifiedAnswer,
+                        orderIndex: q.orderIndex,
+                        prompt: q.prompt,
+                        fromIframe: true,
+                        options: q.options.map(o => ({
+                            answerKey: o.answerKey,
+                            answerText: o.answerText,
+                            selected: o.selected,
+                            correct: o.correct
+                        }))
+                    }));
+                    window.top.postMessage({
+                        type: 'PARAMEXT_OPENEDU_QUESTIONS_SYNC',
+                        stats: mergedStatsByQuestion,
+                        questions: simplifiedQuestions
+                    }, '*');
+                    window.top.postMessage({
+                        type: 'PARAMEXT_OPENEDU_STICK_ONLINE',
+                        online: onlineState.online,
+                        text: onlineState.text
+                    }, '*');
+                    debugSync('iframe_posted_sync_to_top', {
+                        questionCount: simplifiedQuestions.length,
+                        mergedKeys: mergedStatsByQuestion && typeof mergedStatsByQuestion === 'object'
+                            ? Object.keys(mergedStatsByQuestion).length
+                            : 0,
+                        onlineState
+                    });
+                } catch(e) {}
             }
         } finally {
             cycleInFlight = false;

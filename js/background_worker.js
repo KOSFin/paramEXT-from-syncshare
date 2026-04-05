@@ -15,6 +15,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         method: typeof request.method === 'string' ? request.method : 'GET',
         headers: request.headers && typeof request.headers === 'object' ? request.headers : undefined,
         body: typeof request.body === 'string' ? request.body : undefined,
+        mode: 'cors',
+        credentials: 'omit',
+        cache: 'no-store',
+        redirect: 'follow',
+        referrerPolicy: 'no-referrer',
         signal: controller.signal
     }).then(async (response) => {
         let text = '';
@@ -36,14 +41,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse({
             ok: response.ok,
             status: response.status,
+            responseType: response.type,
+            redirected: response.redirected,
+            finalUrl: response.url || request.url,
+            error: (!response.ok && Number(response.status || 0) === 0)
+                ? ('status_0_' + String(response.type || 'unknown'))
+                : '',
             json,
             text
         });
     }).catch((error) => {
+        const isTimeout = controller.signal.aborted;
         sendResponse({
             ok: false,
             status: 0,
-            error: error && error.message ? error.message : 'request_failed'
+            error: isTimeout
+                ? 'request_timeout'
+                : (error && error.message ? error.message : 'request_failed'),
+            errorName: error && error.name ? String(error.name) : '',
+            isTimeout
         });
     }).finally(() => {
         clearTimeout(timer);
