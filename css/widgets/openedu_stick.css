@@ -218,6 +218,126 @@
     background: #e8f3ff;
 }
 
+.paramext-openedu-inline-menu {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    margin-right: 8px;
+    vertical-align: middle;
+}
+
+.paramext-openedu-inline-popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    width: min(360px, 82vw);
+    max-height: 280px;
+    overflow: auto;
+    padding: 8px;
+    border-radius: 10px;
+    border: 1px solid #bdd8fc;
+    background: #ffffff;
+    box-shadow: 0 12px 28px rgba(15, 72, 150, 0.2);
+    z-index: 2147483645;
+    display: none;
+}
+
+.paramext-openedu-inline-menu:hover .paramext-openedu-inline-popover,
+.paramext-openedu-inline-menu:focus-within .paramext-openedu-inline-popover {
+    display: block;
+}
+
+.paramext-openedu-inline-title {
+    font-size: 11px;
+    font-weight: 700;
+    color: #28568d;
+    margin-bottom: 6px;
+}
+
+.paramext-openedu-inline-action {
+    width: 100%;
+    border: 1px solid #c7defb;
+    border-radius: 7px;
+    background: #eef6ff;
+    color: #0f57a7;
+    font-size: 11px;
+    font-weight: 700;
+    text-align: left;
+    padding: 5px 7px;
+    margin-bottom: 5px;
+    cursor: pointer;
+}
+
+.paramext-openedu-inline-action.fallback {
+    background: #fff6e8;
+    border-color: #f0d3a5;
+    color: #885b15;
+}
+
+.paramext-openedu-inline-action[disabled] {
+    opacity: 0.55;
+    cursor: default;
+}
+
+.paramext-openedu-inline-stats {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.paramext-openedu-inline-section {
+    margin-top: 6px;
+    font-size: 10px;
+    font-weight: 700;
+    color: #5c7ca6;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.paramext-openedu-inline-row {
+    margin-top: 4px;
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+}
+
+.paramext-openedu-inline-answer {
+    flex: 1;
+    border: 1px solid #d5e6fb;
+    border-radius: 7px;
+    background: #f9fcff;
+    color: #1b3153;
+    font-size: 11px;
+    text-align: left;
+    padding: 4px 6px;
+    cursor: pointer;
+}
+
+.paramext-openedu-inline-answer:hover {
+    background: #eef6ff;
+}
+
+.paramext-openedu-inline-count {
+    flex-shrink: 0;
+    border-radius: 999px;
+    background: #eaf3ff;
+    color: #11529f;
+    padding: 2px 7px;
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.paramext-openedu-inline-count.fallback {
+    background: #fff1d9;
+    color: #865f17;
+}
+
+.paramext-openedu-inline-empty {
+    margin-top: 6px;
+    font-size: 11px;
+    color: #4f76a3;
+}
+
 .paramext-openedu-highlight {
     animation: paramext-openedu-blink 1.6s ease;
     outline: 2px solid #3a93ff;

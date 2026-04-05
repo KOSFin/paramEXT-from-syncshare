@@ -22,6 +22,7 @@ class OpenEduQuestionIn(BaseModel):
     questionKey: str
     prompt: str = ''
     verified: bool = False
+    isCorrect: bool = False
     answers: list[OpenEduAnswerIn] = Field(default_factory=list)
 
 

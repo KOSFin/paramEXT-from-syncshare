@@ -4,6 +4,7 @@
     const WAND_TOGGLE_ID = 'paramext-openedu-wand-toggle';
     const QUESTION_KEY_ATTR = 'data-paramext-openedu-question-key';
     const INLINE_WAND_ATTR = 'data-paramext-openedu-inline-wand';
+    const INLINE_MENU_CLASS = 'paramext-openedu-inline-menu';
     const MAX_ANSWERS_PER_QUESTION = 5;
     const RETRY_DELAYS_MS = [0, 350, 900];
     const CYCLE_INTERVAL_MS = 7000;
@@ -309,6 +310,34 @@
         }
 
         return last;
+    }
+
+    function describeRequestError(result) {
+        if (!result || result.ok) {
+            return '';
+        }
+
+        if (result.error === 'api_base_url_missing') {
+            return 'не указан API URL';
+        }
+
+        if (result.status === 401) {
+            return '401 (токен)';
+        }
+
+        if (result.status === 403) {
+            return '403 (доступ)';
+        }
+
+        if (result.status === 404) {
+            return '404 (роут)';
+        }
+
+        if (result.status > 0) {
+            return String(result.status);
+        }
+
+        return String(result.error || 'network');
     }
 
     async function probeBackendOnline() {
@@ -685,15 +714,40 @@
         return merged;
     }
 
+    function getNodeDepth(node) {
+        let depth = 0;
+        let current = node;
+        while (current && current.parentElement) {
+            depth += 1;
+            current = current.parentElement;
+        }
+        return depth;
+    }
+
+    function buildQuestionSignature(sourcePath, prompt, options, locationBucket) {
+        const normalizedPrompt = normalizeText(prompt);
+        const optionSignature = options
+            .map((option) => normalizeText(option.answerText))
+            .filter(Boolean)
+            .sort()
+            .join('|');
+
+        return sourcePath + '|' + String(locationBucket) + '|' + normalizedPrompt + '|' + optionSignature;
+    }
+
     function parseQuestions() {
         const blocks = getQuestionBlocks();
 
-        return blocks.map((root, idx) => {
+        const rawQuestions = blocks.map((root, idx) => {
             const prompt = getQuestionPrompt(root);
             const options = getAnswerOptions(root);
             const questionDomId = root.getAttribute('data-problem-id') || root.getAttribute('id') || ('question-' + idx);
             const sourcePath = root.ownerDocument?.location?.pathname || location.pathname;
             const questionKey = hash(sourcePath + '|' + questionDomId + '|' + prompt);
+            const locationBucket = Math.round((root.getBoundingClientRect().top || 0) / 12);
+            const signature = buildQuestionSignature(sourcePath, prompt, options, locationBucket);
+            const nodeSize = root.querySelectorAll('*').length;
+            const nodeDepth = getNodeDepth(root);
 
             root.setAttribute(QUESTION_KEY_ATTR, questionKey);
 
@@ -705,12 +759,49 @@
                 domId: questionDomId,
                 domSelector: '[' + QUESTION_KEY_ATTR + '="' + questionKey + '"]',
                 ownerDocument: root.ownerDocument || document,
+                root,
                 prompt,
                 correct: byStatus,
                 options,
-                hasVerifiedAnswer: byStatus || byOptions
+                hasVerifiedAnswer: byStatus || byOptions,
+                signature,
+                nodeSize,
+                nodeDepth,
+                sourcePath,
+                orderIndex: idx
             };
         }).filter((item) => item.options.length > 0);
+
+        const dedupedBySignature = new Map();
+        rawQuestions.forEach((question) => {
+            const previous = dedupedBySignature.get(question.signature);
+            if (!previous) {
+                dedupedBySignature.set(question.signature, question);
+                return;
+            }
+
+            // Prefer the most specific (deeper and smaller) node to avoid nested duplicate wrappers.
+            const currentScore = (question.nodeDepth * 100000) - question.nodeSize;
+            const previousScore = (previous.nodeDepth * 100000) - previous.nodeSize;
+            if (currentScore > previousScore) {
+                dedupedBySignature.set(question.signature, question);
+            }
+        });
+
+        const deduped = Array.from(dedupedBySignature.values());
+        deduped.sort((a, b) => a.orderIndex - b.orderIndex);
+
+        return deduped.map((item) => ({
+            questionKey: item.questionKey,
+            domId: item.domId,
+            domSelector: item.domSelector,
+            ownerDocument: item.ownerDocument,
+            root: item.root,
+            prompt: item.prompt,
+            correct: item.correct,
+            options: item.options,
+            hasVerifiedAnswer: item.hasVerifiedAnswer
+        }));
     }
 
     function isWholePageCompleted(questions) {
@@ -730,6 +821,7 @@
                 questionKey: question.questionKey,
                 prompt: question.prompt,
                 verified: question.hasVerifiedAnswer,
+                isCorrect: question.correct,
                 answers: question.options.map((option) => ({
                     answerKey: option.answerKey,
                     answerText: option.answerText,
@@ -751,6 +843,10 @@
     }
 
     function locateQuestionBlock(question) {
+        if (question.root instanceof HTMLElement && question.root.isConnected) {
+            return question.root;
+        }
+
         const doc = question.ownerDocument || document;
 
         const byKey = question.domSelector ? doc.querySelector(question.domSelector) : null;
@@ -810,39 +906,121 @@
         return null;
     }
 
-    function applyAnswerToQuestion(question, answer) {
+    function questionAllowsMultipleAnswers(block) {
+        const checkboxes = block.querySelectorAll('input[type="checkbox"]');
+        const radios = block.querySelectorAll('input[type="radio"]');
+        return checkboxes.length > 0 && radios.length === 0;
+    }
+
+    function dispatchInputState(input, checked) {
+        if (!(input instanceof HTMLInputElement)) {
+            return;
+        }
+
+        if (input.checked === checked) {
+            return;
+        }
+
+        input.checked = checked;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    function highlightQuestionBlock(block) {
+        block.classList.add('paramext-openedu-highlight');
+        setTimeout(() => {
+            block.classList.remove('paramext-openedu-highlight');
+        }, 1600);
+    }
+
+    function resolveTargetOptions(options, targetAnswers) {
+        const targets = Array.isArray(targetAnswers) ? targetAnswers : [];
+        const resolved = [];
+        const seen = new Set();
+
+        targets.forEach((target) => {
+            const expectedKey = String(target?.answerKey || '').trim();
+            const expectedText = normalizeText(target?.answerText || target || '');
+
+            let matched = null;
+            if (expectedKey) {
+                matched = options.find((option) => option.answerKey === expectedKey) || null;
+            }
+            if (!matched && expectedText) {
+                matched = options.find((option) => normalizeText(option.answerText) === expectedText) || null;
+            }
+            if (!matched) {
+                return;
+            }
+
+            const key = matched.answerKey + '|' + normalizeText(matched.answerText);
+            if (seen.has(key)) {
+                return;
+            }
+            seen.add(key);
+            resolved.push(matched);
+        });
+
+        return resolved;
+    }
+
+    function applyAnswersToQuestion(question, answers, mode) {
         const block = locateQuestionBlock(question);
         if (!block) {
             return false;
         }
 
-        const expectedKey = String(answer?.answerKey || '').trim();
-        const expectedText = normalizeText(answer?.answerText || answer || '');
         const options = getAnswerOptions(block);
-
-        let selectedOption = null;
-        if (expectedKey) {
-            selectedOption = options.find((option) => option.answerKey === expectedKey) || null;
-        }
-        if (!selectedOption && expectedText) {
-            selectedOption = options.find((option) => normalizeText(option.answerText) === expectedText) || null;
-        }
-        if (!selectedOption) {
+        const targets = resolveTargetOptions(options, answers);
+        if (targets.length === 0) {
             return false;
         }
 
-        const input = findInputForOption(block, selectedOption);
-        if (!(input instanceof HTMLInputElement)) {
+        const multi = questionAllowsMultipleAnswers(block);
+        if (!multi) {
+            const input = findInputForOption(block, targets[0]);
+            if (!(input instanceof HTMLInputElement)) {
+                return false;
+            }
+
+            input.click();
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            highlightQuestionBlock(block);
+            return true;
+        }
+
+        const selectedInputs = new Set();
+        targets.forEach((target) => {
+            const input = findInputForOption(block, target);
+            if (input instanceof HTMLInputElement && input.type === 'checkbox') {
+                selectedInputs.add(input);
+            }
+        });
+
+        if (selectedInputs.size === 0) {
             return false;
         }
 
-        input.click();
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-        block.classList.add('paramext-openedu-highlight');
-        setTimeout(() => {
-            block.classList.remove('paramext-openedu-highlight');
-        }, 1600);
+        const modeName = typeof mode === 'string' ? mode : 'add';
+        if (modeName === 'set-all') {
+            const allCheckboxes = block.querySelectorAll('input[type="checkbox"]');
+            allCheckboxes.forEach((input) => {
+                if (input instanceof HTMLInputElement) {
+                    dispatchInputState(input, selectedInputs.has(input));
+                }
+            });
+        } else {
+            selectedInputs.forEach((input) => {
+                dispatchInputState(input, true);
+            });
+        }
+
+        highlightQuestionBlock(block);
         return true;
+    }
+
+    function applyAnswerToQuestion(question, answer) {
+        return applyAnswersToQuestion(question, [answer], 'add');
     }
 
     function pickAnswersForUi(stats) {
@@ -873,60 +1051,166 @@
     function renderInlineWands(statsByQuestion, questions) {
         const activeKeys = new Set();
 
-        questions.forEach((question) => {
-            const stats = statsByQuestion?.[question.questionKey];
-            if (!stats) {
-                return;
-            }
+        const docsForCleanup = getSearchDocuments();
+        docsForCleanup.forEach((doc) => {
+            const legacyButtons = doc.querySelectorAll('button[' + INLINE_WAND_ATTR + ']');
+            legacyButtons.forEach((button) => {
+                if (!button.closest('.' + INLINE_MENU_CLASS)) {
+                    button.remove();
+                }
+            });
+        });
 
+        questions.forEach((question) => {
             const block = locateQuestionBlock(question);
             if (!block) {
                 return;
             }
 
-            const picked = pickAnswersForUi(stats);
-            const topAnswer = picked.answers.length > 0 ? picked.answers[0] : null;
-            if (!topAnswer) {
-                return;
-            }
+            const stats = statsByQuestion?.[question.questionKey] || createEmptyStatsEntry();
+            const verifiedAnswers = normalizeAnswerStatsList(stats.verifiedAnswers);
+            const fallbackAnswers = normalizeAnswerStatsList(stats.fallbackAnswers);
+            const isMulti = questionAllowsMultipleAnswers(block);
 
-            let button = block.querySelector('button[' + INLINE_WAND_ATTR + '="' + question.questionKey + '"]');
-            if (!(button instanceof HTMLButtonElement)) {
-                button = document.createElement('button');
-                button.type = 'button';
-                button.className = 'paramext-openedu-inline-wand';
-                button.setAttribute(INLINE_WAND_ATTR, question.questionKey);
+            let menu = block.querySelector('.' + INLINE_MENU_CLASS + '[' + INLINE_WAND_ATTR + '="' + question.questionKey + '"]');
+            if (!(menu instanceof HTMLElement)) {
+                menu = document.createElement('span');
+                menu.className = INLINE_MENU_CLASS;
+                menu.setAttribute(INLINE_WAND_ATTR, question.questionKey);
 
                 const anchor = block.querySelector('.problem-header, .problem-title, .question-title, legend, h3') || block;
                 if (anchor.firstChild) {
-                    anchor.insertBefore(button, anchor.firstChild);
+                    anchor.insertBefore(menu, anchor.firstChild);
                 } else {
-                    anchor.appendChild(button);
+                    anchor.appendChild(menu);
                 }
             }
 
-            button.textContent = picked.isFallback ? '|*?' : '|*';
-            button.title = picked.isFallback
-                ? 'Применить наиболее вероятный ответ (резервная статистика)'
-                : 'Применить проверенный ответ';
+            menu.innerHTML = '';
 
-            button.onclick = () => {
-                const applied = applyAnswerToQuestion(question, topAnswer);
+            const trigger = document.createElement('button');
+            trigger.type = 'button';
+            trigger.className = 'paramext-openedu-inline-wand';
+            trigger.textContent = verifiedAnswers.length > 0 ? '|*' : '|*?';
+            trigger.title = verifiedAnswers.length > 0
+                ? 'Открыть список проверенных ответов и статистики'
+                : 'Открыть статистику ответов';
+
+            const popover = document.createElement('div');
+            popover.className = 'paramext-openedu-inline-popover';
+
+            const popTitle = document.createElement('div');
+            popTitle.className = 'paramext-openedu-inline-title';
+            popTitle.textContent = 'paramEXT';
+            popover.appendChild(popTitle);
+
+            const applyVerified = document.createElement('button');
+            applyVerified.type = 'button';
+            applyVerified.className = 'paramext-openedu-inline-action';
+            applyVerified.textContent = isMulti ? 'Вставить правильные ответы' : 'Вставить правильный ответ';
+            applyVerified.disabled = verifiedAnswers.length === 0;
+            applyVerified.addEventListener('click', () => {
+                const payload = isMulti ? verifiedAnswers : [verifiedAnswers[0]];
+                const mode = isMulti ? 'set-all' : 'add';
+                const applied = applyAnswersToQuestion(question, payload, mode);
                 if (!applied) {
                     maybeLogBackendIssue('openedu_apply_failed', {
                         questionKey: question.questionKey,
-                        answerText: topAnswer.answerText,
-                        answerKey: topAnswer.answerKey || ''
+                        mode,
+                        source: 'verified'
                     });
                 }
-            };
+            });
+            popover.appendChild(applyVerified);
+
+            if (settings.openedu.showFallbackStats) {
+                const applyFallback = document.createElement('button');
+                applyFallback.type = 'button';
+                applyFallback.className = 'paramext-openedu-inline-action fallback';
+                applyFallback.textContent = isMulti ? 'Вставить вероятные ответы' : 'Вставить вероятный ответ';
+                applyFallback.disabled = fallbackAnswers.length === 0;
+                applyFallback.addEventListener('click', () => {
+                    const payload = isMulti ? fallbackAnswers : [fallbackAnswers[0]];
+                    const mode = isMulti ? 'set-all' : 'add';
+                    const applied = applyAnswersToQuestion(question, payload, mode);
+                    if (!applied) {
+                        maybeLogBackendIssue('openedu_apply_failed', {
+                            questionKey: question.questionKey,
+                            mode,
+                            source: 'fallback'
+                        });
+                    }
+                });
+                popover.appendChild(applyFallback);
+            }
+
+            const list = document.createElement('ul');
+            list.className = 'paramext-openedu-inline-stats';
+
+            function appendAnswersSection(sectionTitle, answers, isFallbackSection) {
+                if (!answers || answers.length === 0) {
+                    return;
+                }
+
+                const sectionHeader = document.createElement('li');
+                sectionHeader.className = 'paramext-openedu-inline-section';
+                sectionHeader.textContent = sectionTitle;
+                list.appendChild(sectionHeader);
+
+                answers.slice(0, MAX_ANSWERS_PER_QUESTION).forEach((answer) => {
+                    const row = document.createElement('li');
+                    row.className = 'paramext-openedu-inline-row';
+
+                    const answerBtn = document.createElement('button');
+                    answerBtn.type = 'button';
+                    answerBtn.className = 'paramext-openedu-inline-answer';
+                    answerBtn.textContent = answer.answerText;
+                    answerBtn.title = 'Вставить этот вариант';
+                    answerBtn.addEventListener('click', () => {
+                        const applied = applyAnswersToQuestion(question, [answer], isMulti ? 'add' : 'add');
+                        if (!applied) {
+                            maybeLogBackendIssue('openedu_apply_failed', {
+                                questionKey: question.questionKey,
+                                answerText: answer.answerText,
+                                answerKey: answer.answerKey || '',
+                                source: isFallbackSection ? 'fallback-item' : 'verified-item'
+                            });
+                        }
+                    });
+
+                    const count = document.createElement('span');
+                    count.className = 'paramext-openedu-inline-count' + (isFallbackSection ? ' fallback' : '');
+                    count.textContent = String(answer.count || 0);
+
+                    row.appendChild(answerBtn);
+                    row.appendChild(count);
+                    list.appendChild(row);
+                });
+            }
+
+            appendAnswersSection('Проверенные', verifiedAnswers, false);
+            if (settings.openedu.showFallbackStats) {
+                appendAnswersSection('Вероятные', fallbackAnswers, true);
+            }
+
+            if (list.children.length === 0) {
+                const empty = document.createElement('li');
+                empty.className = 'paramext-openedu-inline-empty';
+                empty.textContent = 'Нет статистики по этому вопросу.';
+                list.appendChild(empty);
+            }
+
+            popover.appendChild(list);
+
+            menu.appendChild(trigger);
+            menu.appendChild(popover);
 
             activeKeys.add(question.questionKey);
         });
 
         const docs = getSearchDocuments();
         docs.forEach((doc) => {
-            const stale = doc.querySelectorAll('button[' + INLINE_WAND_ATTR + ']');
+            const stale = doc.querySelectorAll('.' + INLINE_MENU_CLASS + '[' + INLINE_WAND_ATTR + ']');
             stale.forEach((node) => {
                 const key = node.getAttribute(INLINE_WAND_ATTR) || '';
                 if (!activeKeys.has(key)) {
@@ -1180,11 +1464,14 @@
                 if (pushResult.ok || statsResult.ok) {
                     setStickOnline(true, 'API доступен');
                 } else {
+                    const pushErr = describeRequestError(pushResult);
+                    const statsErr = describeRequestError(statsResult);
+                    const errText = [pushErr, statsErr].filter(Boolean).join(' / ');
                     const probeOnline = await probeBackendOnline();
                     if (probeOnline) {
-                        setStickOnline(true, 'API доступен, но запросы отклонены');
+                        setStickOnline(true, 'API ок, sync: ' + (errText || 'ошибка'));
                     } else {
-                        setStickOnline(false, 'API недоступен');
+                        setStickOnline(false, 'API недоступен: ' + (errText || 'network'));
                     }
                 }
 
@@ -1289,7 +1576,11 @@
         installStorageSync();
 
         if (isTopFrame) {
-            setStickOnline(await probeBackendOnline());
+            if (!normalizeApiBaseUrl()) {
+                setStickOnline(false, 'Не указан API URL');
+            } else {
+                setStickOnline(await probeBackendOnline());
+            }
         }
 
         runStickCycle();

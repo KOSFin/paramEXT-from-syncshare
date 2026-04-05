@@ -116,6 +116,11 @@ class Database:
                 )
 
                 for question in questions:
+                    question_verified = bool(question.get('verified'))
+                    question_correct = bool(question.get('isCorrect')) or question_verified
+                    answers = question.get('answers', [])
+                    has_explicit_correct_answers = any(bool(answer.get('correct')) for answer in answers)
+
                     await conn.execute(
                         """
                         INSERT INTO openedu_questions (test_key, question_key, prompt, completed_count, updated_at)
@@ -132,9 +137,18 @@ class Database:
                         1 if completed else 0,
                     )
 
-                    for answer in question.get('answers', []):
-                        fallback_increment = 1 if answer.get('selected') or answer.get('correct') else 0
-                        verified_increment = 1 if question.get('verified') and answer.get('correct') else 0
+                    for answer in answers:
+                        answer_selected = bool(answer.get('selected'))
+                        answer_correct = bool(answer.get('correct'))
+
+                        verified_increment = 1 if question_correct and answer_correct else 0
+
+                        # Fallback stats are allowed only when the question itself is correct,
+                        # and only when explicit correct flags are unavailable.
+                        fallback_increment = 0
+                        if question_correct and not has_explicit_correct_answers and answer_selected:
+                            fallback_increment = 1
+
                         if fallback_increment == 0 and verified_increment == 0:
                             continue
 
