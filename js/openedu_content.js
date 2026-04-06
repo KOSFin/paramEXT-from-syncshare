@@ -1802,6 +1802,109 @@
         statusText.textContent = detail || (isOnline ? 'API доступен' : 'API недоступен');
     }
 
+    function buildQuestionCard(question, index, stats) {
+        const card = document.createElement('div');
+        card.className = 'paramext-question-card';
+
+        const head = document.createElement('div');
+        head.className = 'paramext-question-head';
+
+        const title = document.createElement('p');
+        title.className = 'paramext-question-name';
+        title.textContent = 'Вопрос ' + (index + 1);
+
+        const meta = document.createElement('p');
+        meta.className = 'paramext-question-meta';
+        const completedCount = Number(stats.completedCount || 0);
+        if (stats.similarMatch) {
+            meta.textContent = 'похожий вопрос' + (completedCount > 0 ? ' | завершений: ' + completedCount : '');
+            meta.classList.add('paramext-question-meta--similar');
+        } else if (completedCount > 0) {
+            meta.textContent = 'завершений: ' + completedCount;
+        } else if (stats.localOnly) {
+            meta.textContent = 'локальные ответы';
+        } else {
+            meta.textContent = 'ожидание данных';
+        }
+
+        head.appendChild(title);
+        head.appendChild(meta);
+        card.appendChild(head);
+
+        const list = document.createElement('ul');
+        list.className = 'paramext-answer-list';
+
+        const verifiedAnswers = normalizeAnswerStatsList(stats.verifiedAnswers);
+        const selectedAnswers = normalizeAnswerStatsList(stats.fallbackAnswers);
+        const allAnswers = mergeAndSortAnswers(verifiedAnswers, selectedAnswers);
+
+        if (allAnswers.length === 0) {
+            const emptyItem = document.createElement('li');
+            emptyItem.className = 'paramext-answer-item';
+            emptyItem.textContent = 'Пока нет ответов.';
+            list.appendChild(emptyItem);
+        }
+
+        allAnswers.forEach((answer) => {
+            const item = document.createElement('li');
+            item.className = 'paramext-answer-item';
+
+            const text = document.createElement('span');
+            text.className = 'paramext-answer-text';
+            text.textContent = answer.isVerified ? (answer.answerText + ' ✓') : answer.answerText;
+            item.appendChild(text);
+
+            const countsContainer = document.createElement('div');
+            countsContainer.style.display = 'flex';
+            countsContainer.style.gap = '4px';
+
+            if (answer.isVerified) {
+                const vCount = document.createElement('span');
+                vCount.className = 'paramext-answer-count verified';
+                vCount.textContent = answer.verifiedCount > 0
+                    ? answer.verifiedCount + ' подтв.'
+                    : 'подтв.';
+                countsContainer.appendChild(vCount);
+            }
+
+            const fCount = document.createElement('span');
+            fCount.className = 'paramext-answer-count fallback';
+            fCount.textContent = answer.fallbackCount + ' отв.';
+            countsContainer.appendChild(fCount);
+
+            item.appendChild(countsContainer);
+            list.appendChild(item);
+        });
+
+        card.appendChild(list);
+
+        const topAnswer = allAnswers[0] || null;
+        const controls = document.createElement('div');
+        controls.className = 'paramext-question-controls';
+        const applyBtn = document.createElement('button');
+        applyBtn.className = 'paramext-apply-btn';
+        applyBtn.textContent = (topAnswer && topAnswer.isVerified) ? 'Применить правильный' : 'Применить популярный';
+        applyBtn.disabled = !topAnswer;
+        applyBtn.addEventListener('click', () => {
+            if (!topAnswer) {
+                return;
+            }
+
+            const applied = applyAnswerToQuestion(question, topAnswer);
+            if (!applied) {
+                maybeLogBackendIssue('openedu_apply_failed', {
+                    questionKey: question.questionKey,
+                    answerText: topAnswer.answerText,
+                    answerKey: topAnswer.answerKey || ''
+                });
+            }
+        });
+        controls.appendChild(applyBtn);
+        card.appendChild(controls);
+
+        return card;
+    }
+
     function renderStick(statsByQuestion, questions) {
         if (!stickBody) {
             return;
@@ -1817,113 +1920,87 @@
             return;
         }
 
+        // Split questions into exact and similar groups.
+        const exactItems = [];
+        const similarItems = [];
         questions.forEach((question, index) => {
             const stats = statsByQuestion[question.questionKey];
             if (!stats) {
                 return;
             }
-
-            const card = document.createElement('div');
-            card.className = 'paramext-question-card';
-
-            const head = document.createElement('div');
-            head.className = 'paramext-question-head';
-
-            const title = document.createElement('p');
-            title.className = 'paramext-question-name';
-            title.textContent = 'Вопрос ' + (index + 1);
-
-            const meta = document.createElement('p');
-            meta.className = 'paramext-question-meta';
-            const completedCount = Number(stats.completedCount || 0);
+            const entry = { question, index, stats };
             if (stats.similarMatch) {
-                meta.textContent = 'похожий вопрос' + (completedCount > 0 ? ' | завершений: ' + completedCount : '');
-                meta.classList.add('paramext-question-meta--similar');
-            } else if (completedCount > 0) {
-                meta.textContent = 'завершений: ' + completedCount;
-            } else if (stats.localOnly) {
-                meta.textContent = 'локальные ответы';
+                similarItems.push(entry);
             } else {
-                meta.textContent = 'ожидание данных';
+                exactItems.push(entry);
             }
-
-            head.appendChild(title);
-            head.appendChild(meta);
-            card.appendChild(head);
-
-            const list = document.createElement('ul');
-            list.className = 'paramext-answer-list';
-
-            const verifiedAnswers = normalizeAnswerStatsList(stats.verifiedAnswers);
-            const selectedAnswers = normalizeAnswerStatsList(stats.fallbackAnswers);
-            const allAnswers = mergeAndSortAnswers(verifiedAnswers, selectedAnswers);
-
-            if (allAnswers.length === 0) {
-                const emptyItem = document.createElement('li');
-                emptyItem.className = 'paramext-answer-item';
-                emptyItem.textContent = 'Пока нет ответов.';
-                list.appendChild(emptyItem);
-            }
-
-            allAnswers.forEach((answer) => {
-                const item = document.createElement('li');
-                item.className = 'paramext-answer-item';
-
-                const text = document.createElement('span');
-                text.className = 'paramext-answer-text';
-                text.textContent = answer.isVerified ? (answer.answerText + ' ✓') : answer.answerText;
-                item.appendChild(text);
-
-                const countsContainer = document.createElement('div');
-                countsContainer.style.display = 'flex';
-                countsContainer.style.gap = '4px';
-
-                if (answer.isVerified) {
-                    const vCount = document.createElement('span');
-                    vCount.className = 'paramext-answer-count verified';
-                    vCount.textContent = answer.verifiedCount > 0
-                        ? answer.verifiedCount + ' подтв.'
-                        : 'подтв.';
-                    countsContainer.appendChild(vCount);
-                }
-
-                const fCount = document.createElement('span');
-                fCount.className = 'paramext-answer-count fallback';
-                fCount.textContent = answer.fallbackCount + ' отв.';
-                countsContainer.appendChild(fCount);
-
-                item.appendChild(countsContainer);
-                list.appendChild(item);
-            });
-
-            card.appendChild(list);
-
-            const topAnswer = allAnswers[0] || null;
-            const controls = document.createElement('div');
-            controls.className = 'paramext-question-controls';
-            const applyBtn = document.createElement('button');
-            applyBtn.className = 'paramext-apply-btn';
-            applyBtn.textContent = (topAnswer && topAnswer.isVerified) ? 'Применить правильный' : 'Применить популярный';
-            applyBtn.disabled = !topAnswer;
-            applyBtn.addEventListener('click', () => {
-                if (!topAnswer) {
-                    return;
-                }
-
-                const applied = applyAnswerToQuestion(question, topAnswer);
-                if (!applied) {
-                    maybeLogBackendIssue('openedu_apply_failed', {
-                        questionKey: question.questionKey,
-                        answerText: topAnswer.answerText,
-                        answerKey: topAnswer.answerKey || ''
-                    });
-                }
-            });
-            controls.appendChild(applyBtn);
-            card.appendChild(controls);
-
-            stickBody.appendChild(card);
         });
+
+        const hasSimilar = similarItems.length > 0;
+        const hasExact = exactItems.length > 0;
+
+        if (!hasSimilar) {
+            // No similar matches — render flat list, no tabs needed.
+            exactItems.forEach((item) => {
+                stickBody.appendChild(buildQuestionCard(item.question, item.index, item.stats));
+            });
+            return;
+        }
+
+        // Build tab bar.
+        const tabBar = document.createElement('div');
+        tabBar.className = 'paramext-stick-tabs';
+
+        const exactTab = document.createElement('button');
+        exactTab.type = 'button';
+        exactTab.className = 'paramext-stick-tab active';
+        exactTab.textContent = 'Ответы' + (hasExact ? ' (' + exactItems.length + ')' : '');
+
+        const similarTab = document.createElement('button');
+        similarTab.type = 'button';
+        similarTab.className = 'paramext-stick-tab';
+        similarTab.textContent = 'Похожие (' + similarItems.length + ')';
+
+        tabBar.appendChild(exactTab);
+        tabBar.appendChild(similarTab);
+
+        const exactPane = document.createElement('div');
+        exactPane.className = 'paramext-stick-tab-pane';
+        if (hasExact) {
+            exactItems.forEach((item) => {
+                exactPane.appendChild(buildQuestionCard(item.question, item.index, item.stats));
+            });
+        } else {
+            const empty = document.createElement('div');
+            empty.className = 'paramext-stick-empty';
+            empty.textContent = 'Нет точных совпадений.';
+            exactPane.appendChild(empty);
+        }
+
+        const similarPane = document.createElement('div');
+        similarPane.className = 'paramext-stick-tab-pane';
+        similarPane.style.display = 'none';
+        similarItems.forEach((item) => {
+            similarPane.appendChild(buildQuestionCard(item.question, item.index, item.stats));
+        });
+
+        exactTab.addEventListener('click', () => {
+            exactTab.classList.add('active');
+            similarTab.classList.remove('active');
+            exactPane.style.display = '';
+            similarPane.style.display = 'none';
+        });
+
+        similarTab.addEventListener('click', () => {
+            similarTab.classList.add('active');
+            exactTab.classList.remove('active');
+            similarPane.style.display = '';
+            exactPane.style.display = 'none';
+        });
+
+        stickBody.appendChild(tabBar);
+        stickBody.appendChild(exactPane);
+        stickBody.appendChild(similarPane);
     }
 
     function toggleStick(forceState) {

@@ -139,14 +139,41 @@ class Database:
                     ON openedu_questions (test_key, prompt_norm) WHERE prompt_norm != ''
                 """
             )
-            # Backfill prompt_norm for existing rows.
+
+        # Backfill prompt_norm using Python (SQL \w doesn't handle Cyrillic).
+        await self._backfill_prompt_norms()
+
+    async def _backfill_prompt_norms(self) -> None:
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            # Reset broken values left by the old SQL backfill (Cyrillic was
+            # stripped, leaving whitespace-only strings like ' ').
             await conn.execute(
                 """
                 UPDATE openedu_questions
-                SET prompt_norm = lower(regexp_replace(regexp_replace(prompt, '[^\\w\\s]', '', 'g'), '\\s+', ' ', 'g'))
-                WHERE prompt_norm = '' AND prompt != ''
+                SET prompt_norm = ''
+                WHERE prompt_norm != '' AND btrim(prompt_norm) = ''
                 """
             )
+
+            rows = await conn.fetch(
+                "SELECT test_key, question_key, prompt FROM openedu_questions WHERE prompt_norm = '' AND prompt != ''"
+            )
+            if not rows:
+                return
+
+            updates = [
+                (normalize_prompt(row['prompt']), row['test_key'], row['question_key'])
+                for row in rows
+            ]
+            # Filter out rows where normalization yields empty string.
+            updates = [u for u in updates if u[0]]
+
+            if updates:
+                await conn.executemany(
+                    "UPDATE openedu_questions SET prompt_norm = $1 WHERE test_key = $2 AND question_key = $3",
+                    updates,
+                )
 
     # ── Users ──────────────────────────────────────────────────────
 
