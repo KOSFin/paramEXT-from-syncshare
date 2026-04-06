@@ -9,12 +9,18 @@
     const MAX_ANSWERS_PER_QUESTION = 50;
     const RETRY_DELAYS_MS = [0, 350, 900];
     const CYCLE_INTERVAL_MS = 30000;
-    const MIN_CYCLE_GAP_MS = 5000;
+    const MIN_CYCLE_GAP_MS = 10000;
     const MAX_CONSECUTIVE_FAILURES = 7;
     const AUTH_FAILURE_COOLDOWN_MS = 120000;
     const QUERY_COOLDOWN_MS = 25000;
+    const PUSH_COOLDOWN_MS = 15000;
+    const API_SYNC_MIN_GAP_MS = 8000;
+    const ACTIVE_TAB_REFRESH_MIN_GAP_MS = 45000;
+    const ACTIVE_TAB_REFRESH_AFTER_SUBMIT_WINDOW_MS = 15000;
     const BACKEND_LOG_THROTTLE_MS = 30000;
     const CONTENT_FALLBACK_BLOCK_MS = 90000;
+    const MESSAGE_TRIGGER_THROTTLE_MS = 3000;
+    const MUTATION_TRIGGER_THROTTLE_MS = 3000;
     const DEBUG_SYNC_STORAGE_KEY = 'paramExtOpeneduDebug';
     const PARTICIPANT_KEY_STORAGE = 'paramExtOpeneduParticipantKey';
 
@@ -38,11 +44,11 @@
         try {
             const raw = localStorage.getItem(DEBUG_SYNC_STORAGE_KEY);
             if (raw === null || raw === '') {
-                return true;
+                return false;
             }
-            return !/^(0|false|off|no)$/i.test(String(raw).trim());
+            return /^(1|true|on|yes)$/i.test(String(raw).trim());
         } catch (_) {
-            return true;
+            return false;
         }
     })();
 
@@ -53,6 +59,8 @@
     let statusDot = null;
     let statusText = null;
     let lastAutoAdvanceAt = 0;
+    let lastActiveTabRefreshAt = 0;
+    let lastSubmitActionAt = 0;
     let cycleInFlight = false;
     let lastCycleAt = 0;
     let consecutiveCycleFailures = 0;
@@ -64,14 +72,19 @@
     let lastBackendIssueAt = 0;
     let lastBackendIssueSignature = '';
     let lastAttemptPayloadHash = '';
+    let lastAttemptPushAt = 0;
+    let lastNetworkSyncAt = 0;
     let lastStatsQuerySignature = '';
     let lastStatsQueryAt = 0;
     let lastStatsResponse = null;
     let scheduledCycleTimer = 0;
+    let scheduledCycleForce = false;
     let contentFallbackBlockedUntil = 0;
     let contentFallbackBlockedReason = '';
     let participantKeyCache = '';
     let lastMergedStatsByQuestion = null;
+    let lastMessageTriggerAt = 0;
+    let lastMutationTriggerAt = 0;
 
     let iframeQuestionsCache = [];
     let topFrameIframeQuestions = null;
@@ -673,14 +686,37 @@
         }
     }
 
-    function scheduleCycle(force) {
+    function scheduleCycle(force, source) {
         if (cyclesStopped || scheduledCycleTimer) {
+            scheduledCycleForce = scheduledCycleForce || Boolean(force);
             return;
         }
 
+        const now = Date.now();
+        const reason = String(source || 'generic');
+        if (!force) {
+            if (reason === 'message') {
+                if (now - lastMessageTriggerAt < MESSAGE_TRIGGER_THROTTLE_MS) {
+                    return;
+                }
+                lastMessageTriggerAt = now;
+            }
+
+            if (reason === 'mutation') {
+                if (now - lastMutationTriggerAt < MUTATION_TRIGGER_THROTTLE_MS) {
+                    return;
+                }
+                lastMutationTriggerAt = now;
+            }
+        }
+
+        scheduledCycleForce = scheduledCycleForce || Boolean(force);
+
         scheduledCycleTimer = setTimeout(() => {
             scheduledCycleTimer = 0;
-            runStickCycle(Boolean(force));
+            const runForce = scheduledCycleForce;
+            scheduledCycleForce = false;
+            runStickCycle(Boolean(runForce));
         }, 350);
     }
 
@@ -2044,24 +2080,35 @@
             }
 
             const context = getCourseContext();
+            const normalizedQuestions = questions.map((question) => ({
+                questionKey: String(question.questionKey || ''),
+                correct: Boolean(question.correct),
+                verified: Boolean(question.hasVerifiedAnswer),
+                answers: (Array.isArray(question.options) ? question.options : [])
+                    .map((option) => ({
+                        answerKey: String(option.answerKey || ''),
+                        selected: Boolean(option.selected),
+                        correct: Boolean(option.correct),
+                        answerText: String(option.answerText || '')
+                    }))
+                    .sort((a, b) => {
+                        const keyCmp = a.answerKey.localeCompare(b.answerKey);
+                        if (keyCmp !== 0) {
+                            return keyCmp;
+                        }
+                        return a.answerText.localeCompare(b.answerText);
+                    })
+            })).sort((a, b) => a.questionKey.localeCompare(b.questionKey));
+
             const attemptFingerprint = hash(JSON.stringify({
                 context: {
                     testKey: context.testKey,
                     path: context.path
                 },
-                questions: questions.map((question) => ({
-                    questionKey: question.questionKey,
-                    correct: question.correct,
-                    verified: question.hasVerifiedAnswer,
-                    answers: question.options.map((option) => ({
-                        answerKey: option.answerKey,
-                        selected: option.selected,
-                        correct: option.correct
-                    }))
-                }))
+                questions: normalizedQuestions
             }));
 
-            const questionSignature = hash(JSON.stringify(questions.map((question) => question.questionKey)));
+            const questionSignature = hash(JSON.stringify(normalizedQuestions.map((item) => item.questionKey)));
 
             let pushResult = {
                 ok: true,
@@ -2071,26 +2118,38 @@
             };
             let didPushUpdate = false;
 
-            if (attemptFingerprint !== lastAttemptPayloadHash) {
+            const nowMs = Date.now();
+            const pushCooldownActive = !Boolean(force) && (nowMs - lastAttemptPushAt) < PUSH_COOLDOWN_MS;
+
+            if (attemptFingerprint !== lastAttemptPayloadHash && !pushCooldownActive) {
                 pushResult = await pushAttemptSnapshot(questions);
                 if (pushResult.ok) {
                     lastAttemptPayloadHash = attemptFingerprint;
+                    lastAttemptPushAt = Date.now();
+                    lastNetworkSyncAt = lastAttemptPushAt;
                     didPushUpdate = true;
                     clearSyncBlock();
                 }
+            } else if (attemptFingerprint !== lastAttemptPayloadHash && pushCooldownActive) {
+                debugSync('push_attempt_snapshot_skipped', {
+                    reason: 'push_cooldown',
+                    sinceLastPushMs: nowMs - lastAttemptPushAt,
+                    cooldownMs: PUSH_COOLDOWN_MS
+                });
             } else {
                 debugSync('push_attempt_snapshot_skipped', {
                     reason: 'same_attempt_fingerprint'
                 });
             }
 
+            const networkCooldownActive = !Boolean(force) && !didPushUpdate && (Date.now() - lastNetworkSyncAt) < API_SYNC_MIN_GAP_MS;
             const shouldQueryBase =
                 Boolean(force) ||
                 didPushUpdate ||
                 questionSignature !== lastStatsQuerySignature ||
                 !lastStatsResponse;
             const shouldRespectCooldown = !didPushUpdate && !Boolean(force);
-            const shouldQuery = shouldQueryBase && (!shouldRespectCooldown || (Date.now() - lastStatsQueryAt) >= QUERY_COOLDOWN_MS);
+            const shouldQuery = !networkCooldownActive && shouldQueryBase && (!shouldRespectCooldown || (Date.now() - lastStatsQueryAt) >= QUERY_COOLDOWN_MS);
 
             let statsResult = {
                 ok: true,
@@ -2104,13 +2163,15 @@
                 if (statsResult.ok) {
                     lastStatsQuerySignature = questionSignature;
                     lastStatsQueryAt = Date.now();
+                    lastNetworkSyncAt = lastStatsQueryAt;
                     lastStatsResponse = statsResult.data || { statsByQuestion: null };
                     clearSyncBlock();
                 }
             } else {
                 debugSync('pull_statistics_skipped', {
-                    reason: 'cooldown_or_signature_not_changed',
-                    sinceLastMs: Date.now() - lastStatsQueryAt
+                    reason: networkCooldownActive ? 'api_sync_min_gap' : 'cooldown_or_signature_not_changed',
+                    sinceLastMs: Date.now() - lastStatsQueryAt,
+                    sinceLastNetworkSyncMs: Date.now() - lastNetworkSyncAt
                 });
             }
 
@@ -2233,9 +2294,18 @@
             return;
         }
 
+        const now = Date.now();
+
         const isComplete = activeTab.classList.contains('complete');
         if (!isComplete && settings.openedu.activeTabRefreshEnabled) {
-            activeTab.click();
+            const canRefreshActiveTab =
+                (now - lastSubmitActionAt) <= ACTIVE_TAB_REFRESH_AFTER_SUBMIT_WINDOW_MS &&
+                (now - lastActiveTabRefreshAt) >= ACTIVE_TAB_REFRESH_MIN_GAP_MS;
+
+            if (canRefreshActiveTab) {
+                lastActiveTabRefreshAt = now;
+                activeTab.click();
+            }
             return;
         }
 
@@ -2243,7 +2313,6 @@
             return;
         }
 
-        const now = Date.now();
         const delayMs = Number(settings.openedu.autoAdvanceDelayMs || 1800);
         if (now - lastAutoAdvanceAt < delayMs) {
             return;
@@ -2278,6 +2347,7 @@
 
             const isSubmit = actionable.matches('.submit, .submit.btn-brand, .problem button');
             if (isSubmit) {
+                lastSubmitActionAt = Date.now();
                 let rerenderAttempts = 0;
                 const tryRerender = () => {
                     rerenderAttempts++;
@@ -2289,11 +2359,11 @@
                 setTimeout(tryRerender, 200);
 
                 // Single forced cycle after platform processes the answer.
-                setTimeout(() => scheduleCycle(true), 3000);
+                setTimeout(() => scheduleCycle(true, 'submit-delay'), 3000);
             }
 
             setTimeout(() => {
-                scheduleCycle(isSubmit);
+                scheduleCycle(isSubmit, isSubmit ? 'submit' : 'click');
             }, 300);
         }, true);
 
@@ -2307,39 +2377,65 @@
                 return;
             }
 
+            if (typeof data === 'object' && typeof data.type === 'string' && data.type.startsWith('PARAMEXT_')) {
+                return;
+            }
+
             let text = '';
             if (typeof data === 'string') {
                 text = data.toLowerCase();
             } else {
-                try {
-                    text = JSON.stringify(data).toLowerCase();
-                } catch (_) {
-                    text = '';
-                }
+                const typeValue = typeof data?.type === 'string' ? data.type.toLowerCase() : '';
+                const eventValue = typeof data?.event === 'string' ? data.event.toLowerCase() : '';
+                const actionValue = typeof data?.action === 'string' ? data.action.toLowerCase() : '';
+                text = [typeValue, eventValue, actionValue].filter(Boolean).join('|');
             }
 
             if (!text) {
                 return;
             }
 
-            if (/(problem|submission|submitted|grade|correct|incorrect|response|capa)/.test(text)) {
-                scheduleCycle(false);
+            if (/(problem|submission|submitted|grade|correct|incorrect|capa)/.test(text)) {
+                scheduleCycle(false, 'message');
             }
         });
+
+        const isRelevantMutationNode = (node) => {
+            if (!(node instanceof Element)) {
+                return false;
+            }
+
+            const selector = '.problem, [data-problem-id], .xblock-student_view-problem, .problems-wrapper, .choicegroup, .response-label, .status, .message, .feedback, .sequence-navigation-tabs';
+            if (node.matches(selector)) {
+                return true;
+            }
+
+            if (node.closest(selector)) {
+                return true;
+            }
+
+            return Boolean(node.querySelector(selector));
+        };
 
         const observer = new MutationObserver((mutations) => {
             for (const mutation of mutations) {
                 if (mutation.type === 'attributes') {
                     const node = mutation.target;
-                    if (node instanceof Element && node.matches('.status, .message, .feedback, .choicegroup, .response-label, .sequence-navigation-tabs button')) {
-                        scheduleCycle(false);
+                    if (node instanceof Element && node.matches('.status, .message, .feedback, .choicegroup, .response-label, .sequence-navigation-tabs button, [data-problem-id]')) {
+                        scheduleCycle(false, 'mutation');
                         return;
                     }
                 }
 
                 if (mutation.type === 'childList' && (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0)) {
-                    scheduleCycle(false);
-                    return;
+                    const changedNodes = [];
+                    mutation.addedNodes.forEach((node) => changedNodes.push(node));
+                    mutation.removedNodes.forEach((node) => changedNodes.push(node));
+
+                    if (changedNodes.some((node) => isRelevantMutationNode(node))) {
+                        scheduleCycle(false, 'mutation');
+                        return;
+                    }
                 }
             }
         });
