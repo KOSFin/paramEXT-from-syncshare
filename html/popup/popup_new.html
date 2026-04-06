@@ -56,6 +56,16 @@
 
         <section id="openeduSettings" class="settings-card hidden">
             <h2>Настройки OpenEdu</h2>
+            <div id="openeduSetupWarning" class="setup-warning">
+                <strong>Перед началом работы:</strong>
+                <ol>
+                    <li>Зарегистрируйтесь в <a id="openeduBotLink" href="#" target="_blank" class="hidden">Telegram-боте</a><span id="openeduBotLinkFallback">Telegram-боте (ссылка в настройках API)</span> командой /start</li>
+                    <li>Скопируйте полученный токен</li>
+                    <li>Вставьте токен в разделе «Настройки API» ниже</li>
+                    <li>Нажмите «Проверить API» — статус должен быть «Онлайн»</li>
+                </ol>
+                <span class="setup-warning-note">Без токена расширение не сможет получать и отправлять ответы.</span>
+            </div>
             <div class="form-check">
                 <input class="form-check-input" type="radio" name="openeduMode" id="openeduModeStick" value="stick">
                 <label class="form-check-label" for="openeduModeStick">Палочка (как Moodle)</label>
@@ -116,7 +126,7 @@
             <div class="mb-2">
                 <label for="backendApiToken" class="form-label">Bearer токен</label>
                 <input type="password" class="form-control form-control-sm" id="backendApiToken" placeholder="персональный токен из бота">
-                <a id="botLink" href="#" target="_blank" class="bot-link" style="display:none;">Получить токен в Telegram-боте</a>
+                <a id="botLink" href="#" target="_blank" class="bot-link hidden">Получить токен в Telegram-боте</a>
             </div>
             <div class="mb-2">
                 <label for="backendRequestTimeoutMs" class="form-label">Таймаут запросов (мс)</label>

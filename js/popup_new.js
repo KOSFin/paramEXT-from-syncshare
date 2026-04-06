@@ -164,7 +164,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     const botLinkUrl = (envDefaults[ENV_KEYS.botLink] || '').trim();
     if (botLinkEl && botLinkUrl) {
         botLinkEl.href = botLinkUrl;
-        botLinkEl.style.display = '';
+        botLinkEl.classList.remove('hidden');
+    }
+
+    const openeduBotLink = document.getElementById('openeduBotLink');
+    const openeduBotLinkFallback = document.getElementById('openeduBotLinkFallback');
+    if (openeduBotLink && botLinkUrl) {
+        openeduBotLink.href = botLinkUrl;
+        openeduBotLink.classList.remove('hidden');
+        if (openeduBotLinkFallback) {
+            openeduBotLinkFallback.classList.add('hidden');
+        }
     }
 
     if (window.ParamExtTelemetry) {

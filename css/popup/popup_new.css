@@ -205,6 +205,50 @@ body {
     display: none;
 }
 
+.setup-warning {
+    margin-bottom: 8px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid #e0a832;
+    background: #fef9ec;
+    font-size: 11px;
+    color: #5c4813;
+    line-height: 1.45;
+}
+
+.setup-warning strong {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 11px;
+    color: #8a6d1b;
+}
+
+.setup-warning ol {
+    margin: 0;
+    padding-left: 18px;
+}
+
+.setup-warning ol li {
+    margin-bottom: 2px;
+}
+
+.setup-warning a {
+    color: #0088cc;
+    text-decoration: none;
+    font-weight: 600;
+}
+
+.setup-warning a:hover {
+    text-decoration: underline;
+}
+
+.setup-warning-note {
+    display: block;
+    margin-top: 4px;
+    font-weight: 700;
+    color: #9e7c1a;
+}
+
 .bot-link {
     display: inline-block;
     margin-top: 4px;
