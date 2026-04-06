@@ -865,7 +865,7 @@
         const docs = getSearchDocuments();
 
         docs.forEach((doc) => {
-            const controls = doc.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+            const controls = doc.querySelectorAll('input[type="radio"], input[type="checkbox"], input[type="text"]');
             controls.forEach((control) => {
                 if (!(control instanceof HTMLInputElement)) {
                     return;
@@ -876,7 +876,7 @@
                     return;
                 }
 
-                if (!root.querySelector('label[for], input[type="radio"], input[type="checkbox"]')) {
+                if (!root.querySelector('label[for], input[type="radio"], input[type="checkbox"], input[type="text"]')) {
                     return;
                 }
 
@@ -890,7 +890,7 @@
 
     function getQuestionPrompt(root) {
         const labelNode = root.querySelector(
-            '.problem-header, .wrapper-problem-response p, .wrapper-problem-response h3, .problem-title, .question-title, legend'
+            '.problem-header, .problem-group-label, .wrapper-problem-response p, .wrapper-problem-response h3, .problem-title, .question-title, legend'
         );
         const prompt = textOf(labelNode);
         if (prompt) {
@@ -949,7 +949,7 @@
                 }
                 if (statusClass.includes('correct') || POSITIVE_MARK_RE.test(statusNodeText)) {
                     // For shared status: only the selected option counts as correct.
-                    if (input instanceof HTMLInputElement && !input.checked) {
+                    if (input instanceof HTMLInputElement && input.type !== 'text' && !input.checked) {
                         return false;
                     }
                     return true;
@@ -1088,7 +1088,7 @@
 
         let current = input.parentElement;
         while (current && current !== root) {
-            const allInputs = current.querySelectorAll('input[type="radio"], input[type="checkbox"]').length;
+            const allInputs = current.querySelectorAll('input[type="radio"], input[type="checkbox"], input[type="text"]').length;
             if (allInputs < expectedCount) {
                 current = current.parentElement;
                 continue;
@@ -1122,6 +1122,11 @@
                 ? root.querySelector('#' + escapeSelector(inputId))
                 : label.querySelector('input[type="radio"], input[type="checkbox"]');
 
+            // Skip labels paired with text inputs — handled separately below.
+            if (input instanceof HTMLInputElement && input.type === 'text') {
+                return;
+            }
+
             const groupContainer = getInputGroupContainer(root, input);
             const groupPath = groupContainer && groupContainer !== root ? buildElementPath(root, groupContainer) : '';
             const inputName = input instanceof HTMLInputElement ? String(input.name || '').trim() : '';
@@ -1150,6 +1155,53 @@
                 groupKey,
                 groupPath,
                 inputPath: input instanceof HTMLInputElement ? buildElementPath(root, input) : ''
+            });
+        });
+
+        // Text inputs: each input produces one option with the typed value.
+        const textInputs = root.querySelectorAll('input[type="text"]');
+        textInputs.forEach((input, tidx) => {
+            if (!(input instanceof HTMLInputElement)) {
+                return;
+            }
+
+            const inputId = input.id || '';
+            const inputName = String(input.name || '').trim();
+
+            // Skip if already captured by the label loop.
+            const alreadyCaptured = options.some((o) => o.inputId === inputId && inputId);
+            if (alreadyCaptured) {
+                return;
+            }
+
+            const label = inputId
+                ? root.querySelector('label[for="' + escapeSelector(inputId) + '"]')
+                : null;
+
+            const answerText = input.value.trim();
+            const groupContainer = getInputGroupContainer(root, input);
+            const groupPath = groupContainer && groupContainer !== root ? buildElementPath(root, groupContainer) : '';
+            const groupKey = groupPath
+                ? ('c:' + groupPath)
+                : (inputName ? ('n:' + inputName) : ('t:' + String(tidx)));
+
+            const dedupeKey = groupKey + '|' + inputId;
+            if (usedKeys.has(dedupeKey)) {
+                return;
+            }
+            usedKeys.add(dedupeKey);
+
+            options.push({
+                answerKey: buildAnswerKey(answerText, input, tidx),
+                answerText,
+                selected: answerText.length > 0,
+                correct: isOptionMarkedCorrect(label, input),
+                inputId,
+                inputName,
+                groupKey,
+                groupPath,
+                inputPath: buildElementPath(root, input),
+                inputType: 'text'
             });
         });
 
@@ -1567,6 +1619,18 @@
             }
         }
 
+        // For text inputs, label-text matching doesn't apply
+        // (the label is the prompt, not the answer text).
+        if (option.inputType === 'text') {
+            if (option.inputName) {
+                const byName = block.querySelector('input[type="text"][name="' + escapeSelector(option.inputName) + '"]');
+                if (byName instanceof HTMLInputElement) {
+                    return byName;
+                }
+            }
+            return null;
+        }
+
         const expectedText = normalizeText(option.answerText);
         if (!expectedText) {
             return null;
@@ -1665,6 +1729,42 @@
                 questionKey: question?.questionKey || ''
             });
             return false;
+        }
+
+        // Text input questions: fill the field directly instead of
+        // going through the radio/checkbox resolve logic.
+        const textInput = block.querySelector('input[type="text"]');
+        if (textInput instanceof HTMLInputElement) {
+            const targetText = String(
+                (Array.isArray(answers) ? answers[0] : answers)?.answerText
+                || (Array.isArray(answers) ? answers[0] : answers)
+                || ''
+            ).trim();
+            if (!targetText) {
+                debugSync('apply_answers_failed', {
+                    reason: 'text_input_empty_target',
+                    questionKey: question?.questionKey || ''
+                });
+                return false;
+            }
+
+            const nativeSetter = Object.getOwnPropertyDescriptor(
+                HTMLInputElement.prototype, 'value'
+            )?.set;
+            if (nativeSetter) {
+                nativeSetter.call(textInput, targetText);
+            } else {
+                textInput.value = targetText;
+            }
+            textInput.dispatchEvent(new Event('input', { bubbles: true }));
+            textInput.dispatchEvent(new Event('change', { bubbles: true }));
+            highlightQuestionBlock(block);
+            debugSync('apply_answers_success', {
+                questionKey: question?.questionKey || '',
+                mode: 'text',
+                answerText: targetText
+            });
+            return true;
         }
 
         const options = getAnswerOptions(block);
