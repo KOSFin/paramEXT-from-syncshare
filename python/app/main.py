@@ -92,6 +92,7 @@ async def post_openedu_attempt(payload: OpenEduAttemptIn, user_id: int | None = 
 async def post_openedu_query(payload: OpenEduSolutionsQueryIn, user_id: int | None = Depends(require_api_token)) -> dict:
     from .database import (
         compute_question_fingerprint as _fingerprint,
+        is_exact_question_content_match as _is_exact_match,
         normalize_answer_text as _norm_answer,
         normalize_prompt as _norm,
     )
@@ -101,6 +102,7 @@ async def post_openedu_query(payload: OpenEduSolutionsQueryIn, user_id: int | No
         question_keys = [q.questionKey for q in payload.questions]
 
     stats = await database.query_openedu_stats(payload.context.testKey, question_keys)
+    question_meta = await database.query_openedu_question_metadata(payload.context.testKey, question_keys)
 
     # Fallback chain for questions with no exact stats:
     # 1) Content fingerprint (same prompt + same answer set).
@@ -110,6 +112,17 @@ async def post_openedu_query(payload: OpenEduSolutionsQueryIn, user_id: int | No
         for q in payload.questions:
             entry = stats.get(q.questionKey)
             has_answers = entry and (entry.get('verifiedAnswers') or entry.get('fallbackAnswers'))
+            if has_answers:
+                meta = question_meta.get(q.questionKey) or {}
+                if meta and not _is_exact_match(
+                    meta.get('promptNorm', ''),
+                    meta.get('questionFingerprint', ''),
+                    q.prompt,
+                    q.answers or [],
+                ):
+                    stats[q.questionKey] = {'completedCount': 0, 'verifiedAnswers': [], 'fallbackAnswers': []}
+                    entry = stats[q.questionKey]
+                    has_answers = False
             if not has_answers and q.prompt:
                 answer_norms_set = set()
                 for answer in (q.answers or []):

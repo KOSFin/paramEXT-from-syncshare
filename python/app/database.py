@@ -46,6 +46,34 @@ def compute_question_fingerprint(prompt: str, answer_texts: list[str]) -> str:
     return hashlib.sha256(blob.encode('utf-8')).hexdigest()[:32]
 
 
+def is_exact_question_content_match(
+    stored_prompt_norm: str,
+    stored_question_fingerprint: str,
+    prompt: str,
+    answer_texts: list[str],
+) -> bool:
+    prompt_norm = normalize_prompt(prompt)
+    if not prompt_norm:
+        return True
+
+    normalized_answers = [
+        normalize_answer_text(answer_text)
+        for answer_text in (answer_texts or [])
+    ]
+    normalized_answers = [answer for answer in normalized_answers if answer]
+
+    stored_prompt_norm = str(stored_prompt_norm or '').strip()
+    stored_question_fingerprint = str(stored_question_fingerprint or '').strip()
+
+    if normalized_answers and stored_question_fingerprint:
+        return stored_question_fingerprint == compute_question_fingerprint(prompt, answer_texts)
+
+    if stored_prompt_norm:
+        return stored_prompt_norm == prompt_norm
+
+    return True
+
+
 class Database:
     def __init__(self) -> None:
         self.pool: asyncpg.Pool | None = None
@@ -585,6 +613,30 @@ class Database:
                 entry['fallbackAnswers'].append({'answerKey': row['answer_key'], 'answerText': row['answer_text'], 'count': f})
 
         return result
+
+    async def query_openedu_question_metadata(self, test_key: str, question_keys: list[str]) -> dict[str, dict[str, str]]:
+        assert self.pool is not None
+        if not question_keys:
+            return {}
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT question_key, prompt_norm, question_fingerprint
+                FROM openedu_questions
+                WHERE test_key = $1 AND question_key = ANY($2::text[])
+                """,
+                test_key,
+                question_keys,
+            )
+
+        return {
+            str(row['question_key']): {
+                'promptNorm': str(row['prompt_norm'] or ''),
+                'questionFingerprint': str(row['question_fingerprint'] or ''),
+            }
+            for row in rows
+        }
 
     # ── Similar-question fallback ────────────────────────────────────
 
