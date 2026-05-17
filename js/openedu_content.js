@@ -1049,15 +1049,16 @@
     }
 
     function getQuestionPrompt(root) {
-        const labelNode = root.querySelector(
-            '.problem-header, .problem-group-label, .wrapper-problem-response p, .wrapper-problem-response h3, .problem-title, .question-title, legend'
+        const nodes = root.querySelectorAll(
+            '.problem-header, .problem-group-label, .wrapper-problem-response p, .wrapper-problem-response h3, .problem-title, .question-title, legend, h2, h3, p'
         );
-        const prompt = textOf(labelNode);
-        if (prompt) {
-            return prompt;
+        for (const node of nodes) {
+            const text = textOf(node);
+            if (text && !isGenericPrompt(text) && text !== 'Loading…') {
+                return text;
+            }
         }
-
-        return textOf(root.querySelector('h2, h3, p, legend'));
+        return '';
     }
 
     function getMarkerText(label, input) {
@@ -1926,7 +1927,15 @@
             return;
         }
 
-        input.checked = checked;
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+            HTMLInputElement.prototype, 'checked'
+        )?.set;
+        if (nativeSetter) {
+            nativeSetter.call(input, checked);
+        } else {
+            input.checked = checked;
+        }
+
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
     }
@@ -2047,9 +2056,7 @@
                 return false;
             }
 
-            input.click();
-            input.dispatchEvent(new Event('input', { bubbles: true }));
-            input.dispatchEvent(new Event('change', { bubbles: true }));
+            dispatchInputState(input, true);
             highlightQuestionBlock(block);
             debugSync('apply_answers_success', {
                 questionKey: question?.questionKey || '',
