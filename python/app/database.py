@@ -471,8 +471,9 @@ class Database:
     # ── OpenEdu attempts ───────────────────────────────────────────
 
     @staticmethod
-    def _compute_attempt_fingerprint(context: dict, questions: list) -> str:
+    def _compute_attempt_fingerprint(context: dict, questions: list, actor_key: str) -> str:
         blob = json.dumps({
+            'actorKey': actor_key,
             'testKey': context.get('testKey', ''),
             'path': context.get('path', ''),
             'questions': [
@@ -502,7 +503,8 @@ class Database:
         questions = payload.get('questions', [])
         completed = bool(payload.get('completed', False))
         participant_key = str(context.get('participantKey') or '').strip() or 'anonymous'
-        fingerprint = self._compute_attempt_fingerprint(context, questions)
+        actor_key = f'user:{user_id}' if user_id is not None else f'participant:{participant_key}'
+        fingerprint = self._compute_attempt_fingerprint(context, questions, actor_key)
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -519,12 +521,13 @@ class Database:
                     context.get('title', ''),
                 )
 
-                await conn.execute(
+                attempt_id = await conn.fetchval(
                     """
                     INSERT INTO openedu_attempts (test_key, completed, source, fingerprint, user_id)
                     VALUES ($1, $2, $3, $4, $5)
                     ON CONFLICT (fingerprint) WHERE fingerprint != ''
-                    DO UPDATE SET completed = EXCLUDED.completed, user_id = COALESCE(EXCLUDED.user_id, openedu_attempts.user_id)
+                    DO NOTHING
+                    RETURNING id
                     """,
                     context['testKey'],
                     completed,
@@ -532,6 +535,21 @@ class Database:
                     fingerprint,
                     user_id,
                 )
+
+                if attempt_id is None:
+                    await conn.execute(
+                        """
+                        UPDATE openedu_attempts
+                        SET completed = $2,
+                            user_id = COALESCE($3, user_id)
+                        WHERE fingerprint = $1
+                          AND fingerprint != ''
+                        """,
+                        fingerprint,
+                        completed,
+                        user_id,
+                    )
+                    return
 
                 for question in questions:
                     question_key = str(question.get('questionKey') or '').strip()
@@ -549,7 +567,7 @@ class Database:
 
                     answer_text_by_key: dict[str, str] = {}
                     selected_answer_keys: set[str] = set()
-                    verified_answer_keys: set[str] = set()
+                    current_verified_answer_keys: set[str] = set()
 
                     for answer in answers:
                         answer_key = str(answer.get('answerKey') or '').strip()
@@ -564,11 +582,11 @@ class Database:
                             and bool(answer.get('selected'))
                             and bool(answer.get('correct'))
                         ):
-                            verified_answer_keys.add(answer_key)
+                            current_verified_answer_keys.add(answer_key)
 
                     previous_state = await conn.fetchrow(
                         """
-                        SELECT selected_answer_keys, verified_answer_keys, is_correct
+                        SELECT verified_answer_keys, is_correct
                         FROM openedu_participant_question_state
                         WHERE test_key = $1 AND participant_key = $2 AND question_key = $3
                         """,
@@ -577,13 +595,12 @@ class Database:
                         question_key,
                     )
 
-                    prev_selected_keys = set(previous_state['selected_answer_keys'] or []) if previous_state else set()
                     prev_verified_keys = set(previous_state['verified_answer_keys'] or []) if previous_state else set()
                     prev_is_correct = bool(previous_state['is_correct']) if previous_state else False
 
                     # Verified answers are permanent: merge with previous,
                     # never remove, never decrement.
-                    verified_answer_keys = verified_answer_keys | prev_verified_keys
+                    verified_answer_keys = current_verified_answer_keys | prev_verified_keys
 
                     # Once marked correct, stay correct permanently.
                     if prev_is_correct:
@@ -619,13 +636,15 @@ class Database:
                         completed_delta,
                     )
 
-                    added_selected = selected_answer_keys - prev_selected_keys
-                    # Verified answers only grow — never compute removed_verified.
-                    added_verified = verified_answer_keys - prev_verified_keys
+                    # Counts are per distinct attempt, not per participant state
+                    # delta. The attempt fingerprint already deduplicates
+                    # repeated identical snapshots from the same actor.
+                    selected_increment_keys = selected_answer_keys
+                    verified_increment_keys = current_verified_answer_keys
 
-                    for answer_key in (added_selected | added_verified):
-                        selected_inc = 1 if answer_key in added_selected else 0
-                        verified_inc = 1 if answer_key in added_verified else 0
+                    for answer_key in (selected_increment_keys | verified_increment_keys):
+                        selected_inc = 1 if answer_key in selected_increment_keys else 0
+                        verified_inc = 1 if answer_key in verified_increment_keys else 0
                         if selected_inc == 0 and verified_inc == 0:
                             continue
                         await conn.execute(
